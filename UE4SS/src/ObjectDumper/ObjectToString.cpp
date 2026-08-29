@@ -394,11 +394,27 @@ namespace RC::ObjectDumper
         object_to_string_functions[FTextProperty::StaticClass().HashObject()] = &property_to_string;
         object_to_string_functions[FStrProperty::StaticClass().HashObject()] = &property_to_string;
         object_to_string_functions[FDelegateProperty::StaticClass().HashObject()] = &delegateproperty_to_string;
-        object_to_string_functions[FMulticastDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+        try
+        {
+            object_to_string_functions[FMulticastDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+        }
+        catch ([[maybe_unused]]const std::exception& e) {}
         if (Version::IsAtLeast(4, 23))
         {
-            object_to_string_functions[FMulticastInlineDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
-            object_to_string_functions[FMulticastSparseDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+            // A game can legitimately ship without every delegate property type (UE5.x makes
+            // dynamic-multicast sparse by default); an unregistered FFieldClass throws from
+            // StaticClass(), so treat a throw as "type not present" instead of aborting the
+            // whole dispatch table.
+            try
+            {
+                object_to_string_functions[FMulticastInlineDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+            }
+            catch ([[maybe_unused]]const std::exception& e) {}
+            try
+            {
+                object_to_string_functions[FMulticastSparseDelegateProperty::StaticClass().HashObject()] = &multicastdelegateproperty_to_string;
+            }
+            catch ([[maybe_unused]]const std::exception& e) {}
         }
         object_to_string_functions[FInterfaceProperty::StaticClass().HashObject()] = &interfaceproperty_to_string;
         if (Version::IsAtLeast(4, 25))
