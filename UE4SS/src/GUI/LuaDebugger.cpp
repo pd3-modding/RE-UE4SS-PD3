@@ -22,6 +22,7 @@
 #include <LuaType/LuaFText.hpp>
 #include <LuaType/LuaUnrealString.hpp>
 #include <LuaType/LuaTArray.hpp>
+#include <MCP/MCPServer.hpp>
 #include <Mod/LuaMod.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
@@ -1709,6 +1710,12 @@ namespace RC::GUI
             if (ImGui::BeginTabItem(ICON_FA_CUBES " Mods"))
             {
                 render_mods_tab();
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem(ICON_FA_PLUG " MCP"))
+            {
+                render_mcp_tab();
                 ImGui::EndTabItem();
             }
 
@@ -3957,6 +3964,65 @@ namespace RC::GUI
 
         Output::send(STR("Created new file '{}'\n"), to_generic_string(file_path.string()));
         return true;
+    }
+
+    auto LuaDebugger::render_mcp_tab() -> void
+    {
+        ImGui::TextDisabled("Status:");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(to_string(MCP::MCPServer::status_line()).c_str());
+
+        if (!MCP::MCPServer::is_compiled_in())
+        {
+            ImGui::Separator();
+            ImGui::TextWrapped("This build has no MCP support. Reconfigure with -DUE4SS_ENABLE_MCP=ON to build it in.");
+            return;
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button(ICON_FA_TRASH " Clear"))
+        {
+            MCP::MCPServer::clear_activity();
+        }
+
+        ImGui::Separator();
+
+        const auto activity = MCP::MCPServer::recent_activity();
+
+        ImGui::BeginChild("##mcp_activity", ImVec2{0, 0}, false, ImGuiWindowFlags_HorizontalScrollbar);
+        if (activity.empty())
+        {
+            ImGui::TextDisabled("No MCP activity yet.");
+        }
+        for (const auto& record : activity)
+        {
+            const auto as_time_t = std::chrono::system_clock::to_time_t(record.time);
+            std::tm broken_down{};
+            localtime_s(&broken_down, &as_time_t);
+            char stamp[16]{};
+            std::strftime(stamp, sizeof(stamp), "%H:%M:%S", &broken_down);
+
+            ImGui::TextDisabled("%s", stamp);
+            ImGui::SameLine();
+
+            if (record.kind == MCP::ActivityRecord::Kind::ToolCall)
+            {
+                const auto colour = record.ok ? ImVec4{0.55f, 0.85f, 0.55f, 1.0f} : ImVec4{1.0f, 0.45f, 0.45f, 1.0f};
+                ImGui::TextColored(colour, "%s", to_string(record.text).c_str());
+            }
+            else
+            {
+                ImGui::TextUnformatted(to_string(record.text).c_str());
+            }
+        }
+
+        // Follow the newest entry, but only while the user is already at the bottom -- yanking
+        // the view back down while they are scrolled up reading is worse than not following.
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+        {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
     }
 
     auto LuaDebugger::render_mods_tab() -> void

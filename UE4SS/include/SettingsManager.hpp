@@ -128,6 +128,19 @@ namespace RC
             int64_t FExecVTableOffsetInLocalPlayer{0x28};
         } Hooks;
 
+        // In-process MCP server. Off by default and loopback-only on purpose: it executes
+        // arbitrary Lua inside the game, so it is a development tool, not something to leave
+        // running during normal play. See deps/first/mcp_bind.
+        struct SectionMCP
+        {
+            bool Enabled{false};
+            File::StringType BindAddress{STR("127.0.0.1")};
+            int64_t Port{8787};
+            // How long a tool call waits for the game thread before giving up. A wedged game
+            // thread (mid-map-load, or crashed) must not hang the HTTP request forever.
+            int64_t GameThreadTimeoutMs{10000};
+        } MCP;
+
         struct ExperimentalFeatures
         {
         } Experimental;

@@ -5,3 +5,7 @@
 [submodule "deps/first/patternsleuth"]
 	path = deps/first/patternsleuth
 	url = git@github.com:trumank/patternsleuth.git
+[submodule "deps/first/mcp_bind"]
+	path = deps/first/mcp_bind
+	url = https://github.com/edmiester777/RE-UE4SS-MCP.git
+	branch = main

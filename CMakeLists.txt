@@ -30,6 +30,19 @@ if(UE4SS_PROFILERS)
     add_compile_definitions(UE4SS_PROFILERS)
 endif()
 
+# In-process MCP server (deps/first/mcp_bind). Off by default: it pulls a tokio/axum Rust
+# dependency tree that adds noticeably to build time, and it is a development tool -- it
+# executes arbitrary Lua inside the game process. Also needs [MCP] Enabled=1 at runtime.
+option(UE4SS_ENABLE_MCP "Build the in-process MCP server" OFF)
+if(UE4SS_ENABLE_MCP)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/first/mcp_bind/Cargo.toml")
+        message(FATAL_ERROR
+            "UE4SS_ENABLE_MCP is ON but deps/first/mcp_bind is empty. "
+            "Run: git submodule update --init --recursive")
+    endif()
+    add_compile_definitions(UE4SS_ENABLE_MCP)
+endif()
+
 # Check IPO/LTO support
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 message("IPO/LTO support: ${IPO_SUPPORTED}; ${IPO_ERROR}")

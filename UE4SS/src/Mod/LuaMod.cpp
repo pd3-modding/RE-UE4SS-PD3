@@ -6264,6 +6264,113 @@ Overloads:
         LuaStatics::console_executor_enabled = false;
     }
 
+    // ---------------------------------------------------------------------------------------
+    // MCP executor
+    //
+    // A persistent Lua state for the in-process MCP server, set up exactly like the console
+    // executor. It is separate from the console one so that enabling MCP does not disturb
+    // 'luastart', and so a client can keep globals between tool calls.
+    // ---------------------------------------------------------------------------------------
+    static LuaMadeSimple::Lua* s_mcp_executor{};
+
+    // Buffer that the MCP state's `print` appends to. This is a plain object rather than a
+    // pointer to the caller's string on purpose: Lua's error handling is longjmp-based here
+    // (LuaRaw builds as C), so a __tostring metamethod that raises would skip any cleanup that
+    // reset a pointer and leave it dangling. Owning the buffer makes that unrepresentable.
+    static std::string s_mcp_captured_output{};
+
+    static auto mcp_print(lua_State* L) -> int
+    {
+        const int arg_count = lua_gettop(L);
+        for (int i = 1; i <= arg_count; ++i)
+        {
+            size_t length{};
+            // luaL_tolstring honours __tostring and pushes the result, which we then pop.
+            const char* text = luaL_tolstring(L, i, &length);
+            if (i > 1)
+            {
+                s_mcp_captured_output.append("\t");
+            }
+            s_mcp_captured_output.append(text ? text : "", text ? length : 0);
+            lua_pop(L, 1);
+        }
+        s_mcp_captured_output.append("\n");
+        return 0;
+    }
+
+    auto LuaMod::mcp_eval(std::string_view code, std::string& output) -> bool
+    {
+        if (!s_mcp_executor)
+        {
+            s_mcp_executor = &LuaMadeSimple::new_state();
+            s_mcp_executor->open_all_libs();
+            setup_lua_global_functions_internal(*s_mcp_executor, LuaMod::IsTrueMod::No);
+            setup_lua_classes_internal(*s_mcp_executor);
+            register_input_globals(*s_mcp_executor);
+            register_all_property_types(*s_mcp_executor);
+            register_object_flags(*s_mcp_executor);
+
+            // Redirect print into the capture buffer so tool results carry it back to the
+            // client instead of it vanishing into the log.
+            lua_pushcfunction(s_mcp_executor->get_lua_state(), mcp_print);
+            lua_setglobal(s_mcp_executor->get_lua_state(), "print");
+        }
+
+        lua_State* L = s_mcp_executor->get_lua_state();
+        const int stack_base = lua_gettop(L);
+        s_mcp_captured_output.clear();
+
+        // Appends captured print output ahead of whatever the caller adds, and restores the
+        // stack. Called on every exit path.
+        auto finish = [&](bool succeeded) -> bool {
+            if (!s_mcp_captured_output.empty())
+            {
+                output.insert(0, s_mcp_captured_output);
+                s_mcp_captured_output.clear();
+            }
+            lua_settop(L, stack_base);
+            return succeeded;
+        };
+
+        const int error_handler_index = LuaMadeSimple::push_pcall_error_handler(L);
+
+        if (luaL_loadstring(L, std::string{code}.c_str()) != LUA_OK)
+        {
+            const char* message = lua_tostring(L, -1);
+            output.append(message ? message : "unknown error while loading chunk");
+            return finish(false);
+        }
+
+        if (lua_pcall(L, 0, LUA_MULTRET, error_handler_index) != LUA_OK)
+        {
+            const char* message = lua_tostring(L, -1);
+            output.append(message ? message : "unknown error while executing chunk");
+            return finish(false);
+        }
+
+        // Everything above the error handler is a return value.
+        const int result_count = lua_gettop(L) - error_handler_index;
+        for (int i = 0; i < result_count; ++i)
+        {
+            size_t length{};
+            const char* text = luaL_tolstring(L, error_handler_index + 1 + i, &length);
+            output.append(i == 0 ? "=> " : "\t");
+            output.append(text ? text : "", text ? length : 0);
+            lua_pop(L, 1);
+        }
+        if (result_count > 0)
+        {
+            output.append("\n");
+        }
+
+        if (output.empty() && s_mcp_captured_output.empty())
+        {
+            output = "<no output>";
+        }
+
+        return finish(true);
+    }
+
     static auto script_hook([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::UObject* Context, Unreal::FFrame& Stack, [[maybe_unused]] void* RESULT_DECL) -> void
     {
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};

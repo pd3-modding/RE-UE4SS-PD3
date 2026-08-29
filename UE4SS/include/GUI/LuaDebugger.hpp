@@ -290,6 +290,7 @@ namespace RC::GUI
         auto render_debug_view() -> void;
         auto render_script_editor() -> void;
         auto render_mods_tab() -> void;
+        auto render_mcp_tab() -> void;
         auto render_breakpoints_panel() -> void;
         auto render_repl() -> void;
         auto render_value_tree(std::vector<LuaValueNode>& nodes) -> void;

@@ -267,6 +267,17 @@ namespace RC
         static auto remove_function_hook_data(std::vector<FunctionHookData>&, Unreal::FName) -> void;
         static auto remove_function_hook_data(std::vector<FunctionHookData>&, const Unreal::UObject*) -> void;
         static auto remove_function_hook_data(std::vector<FunctionHookData>&, const std::vector<Unreal::FName>&) -> void;
+
+      public:
+        // Evaluate `code` in a Lua state dedicated to the MCP server, capturing anything it
+        // prints plus the values it returns into `output`. Returns false on a load or runtime
+        // error, in which case `output` holds the error and traceback.
+        //
+        // The state is created on first use and persists, so globals set by one call are still
+        // there for the next -- it behaves like a REPL session rather than a fresh sandbox.
+        //
+        // MUST be called on the game thread: the code it runs can touch live UObjects.
+        RC_UE4SS_API static auto mcp_eval(std::string_view code, std::string& output) -> bool;
     };
 
     struct LuaStatics

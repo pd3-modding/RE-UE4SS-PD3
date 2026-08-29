@@ -143,6 +143,15 @@ target_link_libraries(UE4SS PUBLIC
     patternsleuth_bind
 )
 
+# In-process MCP server. The crate is imported by Corrosion in deps/third/corrosion; the
+# header that declares its FFI ships alongside the Rust in the same repository.
+if(UE4SS_ENABLE_MCP)
+    target_link_libraries(UE4SS PUBLIC mcp_bind)
+    target_include_directories(UE4SS PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../deps/first/mcp_bind/include>
+    )
+endif()
+
 # Link third-party dependencies
 target_link_libraries(UE4SS PUBLIC
     fmt ImGui PolyHook_2 

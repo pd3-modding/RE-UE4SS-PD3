@@ -37,6 +37,7 @@
 #include <SigScanner/SinglePassSigScanner.hpp>
 #include <Signatures.hpp>
 #include <Timer/ScopedTimer.hpp>
+#include <MCP/MCPServer.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/AGameMode.hpp>
 #include <Unreal/AGameModeBase.hpp>
@@ -454,6 +455,10 @@ namespace RC
 
     UE4SSProgram::~UE4SSProgram()
     {
+        // Before anything else: this releases MCP clients blocked waiting on the game thread,
+        // which will never be serviced again once we start tearing down.
+        MCP::MCPServer::stop();
+
         // Shut down the event loop
         m_processing_events = false;
 
@@ -490,6 +495,11 @@ namespace RC
             UAssetRegistry::SetMaxMemoryUsageDuringAssetLoading(settings_manager.Memory.MaxMemoryUsageDuringAssetLoading);
 
             share_lua_functions();
+
+            // Started last: it needs settings parsed, Unreal set up (for the engine tick hook
+            // that services its requests) and the Lua machinery available. A no-op unless
+            // built with UE4SS_ENABLE_MCP and enabled in UE4SS-settings.ini.
+            MCP::MCPServer::start();
 
             // Only deal with the event loop thread here if the 'Test' constructor doesn't need to be called
 #ifndef RUN_TESTS
