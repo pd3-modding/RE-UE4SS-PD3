@@ -921,6 +921,88 @@ namespace RC
             }
         });
 
+        // Per-function virtual offset overrides.
+        //
+        // VTableLayout.ini above needs the complete ordered virtual list for a class, because
+        // it derives each offset from the entry's index. That is unusable when a game ships
+        // with different compile-time feature flags than the build the generated tables came
+        // from: editor-only and plugin-gated virtuals shift the layout, and the shift is not
+        // uniform across a class, so reconstructing a full ordered list means reversing every
+        // slot. This file instead overrides individual functions by name, which is all that is
+        // needed to repair the handful of virtuals UE4SS actually hooks.
+        //
+        // Entries here win over both VTableLayout.ini and the generated per-version defaults
+        // (those only fill in names that are still missing).
+        //
+        //   [AActor]
+        //   BeginPlay = 0x3C0
+        TRY([&]() {
+            ProfilerScopeNamed("loading virtual function offset per-function overrides");
+            static File::StringType overrides_file{ensure_str((m_working_directory / STR("VTableOffsetOverrides.ini")))};
+            if (!std::filesystem::exists(overrides_file)) { return; }
+
+            auto file = File::open(overrides_file, File::OpenFor::Reading, File::OverwriteExistingFile::No, File::CreateIfNonExistent::No);
+            Ini::Parser parser;
+            parser.parse(file);
+            file.close();
+
+            using VTableMap = std::unordered_map<File::StringType, uint32_t>;
+            const std::pair<const wchar_t*, VTableMap*> sections[]{
+                    {STR("UObjectBase"), &Unreal::UObjectBase::VTableLayoutMap},
+                    {STR("UObjectBaseUtility"), &Unreal::UObjectBaseUtility::VTableLayoutMap},
+                    {STR("UObject"), &Unreal::UObject::VTableLayoutMap},
+                    {STR("UField"), &Unreal::UField::VTableLayoutMap},
+                    {STR("UStruct"), &Unreal::UStruct::VTableLayoutMap},
+                    {STR("UEngine"), &Unreal::UEngine::VTableLayoutMap},
+                    {STR("AActor"), &Unreal::AActor::VTableLayoutMap},
+                    {STR("AGameModeBase"), &Unreal::AGameModeBase::VTableLayoutMap},
+                    {STR("AGameMode"), &Unreal::AGameMode::VTableLayoutMap},
+                    {STR("UPlayer"), &Unreal::UPlayer::VTableLayoutMap},
+                    {STR("ULocalPlayer"), &Unreal::ULocalPlayer::VTableLayoutMap},
+                    {STR("UDataTable"), &Unreal::UDataTable::VTableLayoutMap},
+                    {STR("FField"), &Unreal::FField::VTableLayoutMap},
+                    {STR("FProperty"), &Unreal::FProperty::VTableLayoutMap},
+                    {STR("FOutputDevice"), &Unreal::FOutputDevice::VTableLayoutMap},
+                    {STR("FMalloc"), &Unreal::FMalloc::VTableLayoutMap},
+            };
+
+            Output::send<Color::Blue>(STR("VTableOffsetOverrides.ini\n"));
+            size_t applied{};
+            for (const auto& [section_name, map] : sections)
+            {
+                parser.get_list(section_name).for_each([&](File::StringType key, const Ini::Value& value) {
+                    if (!value.is_valid_string())
+                    {
+                        Output::send<LogLevel::Warning>(STR("{}::{} has no value; ignoring.\n"), section_name, key);
+                        return;
+                    }
+
+                    const auto& raw = value.get_string_value();
+                    unsigned long offset{};
+                    size_t parsed{};
+                    // Base 0 so both 0x290 and 656 work.
+                    try { offset = std::stoul(raw, &parsed, 0); }
+                    catch (const std::exception&) { parsed = 0; }
+                    if (parsed != raw.size())
+                    {
+                        Output::send<LogLevel::Warning>(STR("{}::{} = '{}' is not a number; ignoring.\n"), section_name, key, raw);
+                        return;
+                    }
+                    if (offset % sizeof(void*) != 0)
+                    {
+                        Output::send<LogLevel::Warning>(STR("{}::{} = 0x{:X} is not pointer-aligned, so it cannot be a vtable offset; ignoring.\n"),
+                                                        section_name, key, offset);
+                        return;
+                    }
+
+                    map->insert_or_assign(key, static_cast<uint32_t>(offset));
+                    Output::send(STR("{}::{} = 0x{:X}\n"), section_name, key, offset);
+                    ++applied;
+                });
+            }
+            Output::send<Color::Blue>(STR("Applied {} virtual offset override(s)\n"), applied);
+        });
+
         config.bHookProcessInternal = settings_manager.Hooks.HookProcessInternal;
         config.bHookProcessLocalScriptFunction = settings_manager.Hooks.HookProcessLocalScriptFunction;
         config.bHookLoadMap = settings_manager.Hooks.HookLoadMap;
