@@ -1,11 +1,11 @@
 [submodule "deps/first/Unreal"]
 	path = deps/first/Unreal
-	url = https://github.com/edmiester777/UEPseudo-PD3.git
+	url = https://github.com/pd3-modding/UEPseudo-PD3.git
 	branch = pd3
 [submodule "deps/first/patternsleuth"]
 	path = deps/first/patternsleuth
 	url = git@github.com:trumank/patternsleuth.git
 [submodule "deps/first/mcp_bind"]
 	path = deps/first/mcp_bind
-	url = https://github.com/edmiester777/RE-UE4SS-MCP.git
+	url = https://github.com/pd3-modding/RE-UE4SS-MCP.git
 	branch = main
