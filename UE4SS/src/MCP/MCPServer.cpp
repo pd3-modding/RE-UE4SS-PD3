@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 
@@ -276,6 +277,47 @@ namespace RC::MCP
             return true;
         }
 
+        // Runs on the UE4SS event loop thread, NOT the game thread -- that is where mod
+        // install/uninstall belongs, and it is the same path the GUI's "Restart All Mods"
+        // button takes.
+        extern "C" bool reload_mods_cb(void*, McpString* out)
+        {
+            auto& program = UE4SSProgram::get_program();
+            if (!program.can_process_events())
+            {
+                make_string("UE4SS is not processing events, so a reload cannot be queued right now.", out);
+                return false;
+            }
+
+            // queue_reinstall_mods() self-marshals, but calling it directly would give us no
+            // way to know when it finished. Queueing it ourselves means that by the time the
+            // event runs we are already on the event loop thread, so it executes inline and
+            // the promise is only satisfied once the mods are actually back up.
+            auto finished = std::make_shared<std::promise<void>>();
+            auto future = finished->get_future();
+
+            program.queue_event([finished]() {
+                UE4SSProgram::get_program().queue_reinstall_mods();
+                finished->set_value();
+            });
+
+            // Reinstalling parses and starts every mod, so allow considerably longer than a
+            // Lua call. Reuses the configured budget rather than inventing a second knob.
+            const auto timeout = std::chrono::milliseconds{std::max<int64_t>(5000, UE4SSProgram::settings_manager.MCP.GameThreadTimeoutMs * 3)};
+
+            if (future.wait_for(timeout) != std::future_status::ready)
+            {
+                make_string(fmt::format("Timed out after {}ms waiting for the reload to finish. It may still complete; "
+                                        "check log_tail for 'Re-installing all mods'.",
+                                        timeout.count()),
+                            out);
+                return false;
+            }
+
+            make_string("Mods reinstalled. Lua files were re-read from disk.", out);
+            return true;
+        }
+
         auto make_host() -> McpHost
         {
             McpHost host{};
@@ -284,6 +326,7 @@ namespace RC::MCP
             host.lua_eval = &lua_eval_cb;
             host.game_status = &game_status_cb;
             host.log_tail = &log_tail_cb;
+            host.reload_mods = &reload_mods_cb;
             host.on_tool_call = &on_tool_call_cb;
             host.free_string = &free_string_cb;
             return host;
