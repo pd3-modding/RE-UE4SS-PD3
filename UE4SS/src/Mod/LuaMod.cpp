@@ -2468,6 +2468,41 @@ Overloads:
             return 0;
         });
 
+        // Called when this mod is being unloaded -- a reload, the GUI's "Restart All Mods", or
+        // shutdown -- with the Lua state still usable and every hook already unregistered.
+        // Undo your writes here: after this returns, the state that remembers them is closed
+        // while the values you wrote are still live in the game.
+        //
+        // Runs on the caller's thread, which is the UE4SS event loop thread and not the game
+        // thread. Property reads and writes on objects you already hold are safe; UFunction
+        // calls, asset loads and ExecuteInGameThread are not. See LuaMod::fire_on_mod_unload.
+        lua.register_function("RegisterModUnload", [](const LuaMadeSimple::Lua& lua) -> int {
+            std::string error_overload_not_found{R"(
+No overload found for function 'RegisterModUnload'.
+Overloads:
+#1: RegisterModUnload(LuaFunction Callback))"};
+
+            if (!lua.is_function())
+            {
+                lua.throw_error(error_overload_not_found);
+            }
+
+            auto mod = get_mod_ref(lua);
+            auto hook_lua = get_hook_lua(mod);
+
+            lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+
+            // Take a reference to the lua function (it also pops it off the stack)
+            const int32_t lua_callback_registry_index = hook_lua->registry().make_ref();
+
+            LuaMod::m_mod_unload_callbacks.emplace_back(LuaMod::LuaCallbackData{
+                    .lua = hook_lua,
+                    .instance_of_class = nullptr,
+                    .registry_indexes = {std::pair<const LuaMadeSimple::Lua*, LuaMod::LuaCallbackData::RegistryIndex>{hook_lua, lua_callback_registry_index}}});
+
+            return 0;
+        });
+
         lua.register_function("RegisterInitGameStatePreHook", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'RegisterInitGameStatePreHook'.
@@ -5923,6 +5958,40 @@ Overloads:
         }
     }
 
+    // Runs the handlers a mod registered with RegisterModUnload, for THIS mod only.
+    //
+    // Called from uninstall() once every UFunction hook for the mod is unregistered but before
+    // the Lua state is closed -- see the call site for why that window and no other.
+    //
+    // A handler runs on whichever thread requested the uninstall, which for a reload is the
+    // UE4SS event loop thread, NOT the game thread. That makes this the wrong place for
+    // anything ambitious: calling a UFunction, spawning an actor or loading an asset off the
+    // game thread is a crash. Reading and writing properties on UObjects the mod already holds
+    // is fine, and undoing its own writes is what this exists for. ExecuteInGameThread does not
+    // help either -- the queued action is discarded a few lines below, along with the state.
+    //
+    // Each handler is fired inside TRY so that one mod's broken teardown cannot abort the
+    // uninstall and strand every other mod's.
+    auto LuaMod::fire_on_mod_unload() -> void
+    {
+        for (const auto& callback_data : m_mod_unload_callbacks)
+        {
+            if (callback_data.lua == nullptr || get_mod_ref(*callback_data.lua) != this)
+            {
+                continue;
+            }
+
+            for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
+            {
+                TRY([&] {
+                    const auto& lua = *lua_ptr;
+                    lua.registry().get_function_ref(registry_index.lua_index);
+                    lua.call_function(0, 0);
+                });
+            }
+        }
+    }
+
     auto LuaMod::load_and_execute_script(const std::filesystem::path& script_path) -> bool
     {
         try
@@ -6163,6 +6232,14 @@ Overloads:
                 item->unreal_function->UnregisterHook(item->post_callback_id);
             }
         }
+
+        // Give the mod's Lua a last chance to put the game back the way it found it.
+        // Deliberately HERE and nowhere else: every UFunction hook for this mod has just been
+        // unregistered, so no game-thread callback can enter this Lua state any more, and the
+        // state itself is not closed until further down. Firing earlier would race a hook
+        // that is still live; firing later would be a use-after-close.
+        fire_on_mod_unload();
+        erase_from_container(this, m_mod_unload_callbacks);
 
         // Remove any pending game thread actions for this mod BEFORE closing Lua state
         // Otherwise process_event_hook may try to execute actions with an invalid Lua state
