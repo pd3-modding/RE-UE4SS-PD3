@@ -414,6 +414,8 @@ namespace RC::LuaType
 
     auto is_a_implementation(const LuaMadeSimple::Lua& lua) -> int;
 
+    auto get_struct_array_element_implementation(const LuaMadeSimple::Lua& lua) -> int;
+
     template <typename DerivedType, typename ObjectName>
     class UObjectBase;
 
@@ -622,6 +624,14 @@ namespace RC::LuaType
             table.add_pair("SetPropertyValue", [](const LuaMadeSimple::Lua& lua) -> int {
                 prepare_to_handle(Operation::Set, lua);
                 return 1;
+            });
+
+            // Fixed C arrays (ArrayDim > 1) resolve to element 0 through __index -- there is no
+            // ArrayIndex anywhere in the property pushers. This is the one way in: a struct
+            // handle rooted at the requested element. PAYDAY 3's per-difficulty settings arrays
+            // are the motivating case; see the implementation for the constraints.
+            table.add_pair("GetStructArrayElement", [](const LuaMadeSimple::Lua& lua) -> int {
+                return get_struct_array_element_implementation(lua);
             });
 
             table.add_pair("IsClass", [](const LuaMadeSimple::Lua& lua) -> int {

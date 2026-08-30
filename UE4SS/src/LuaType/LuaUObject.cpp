@@ -2140,6 +2140,78 @@ Overloads:
         return 1;
     }
 
+    // A fixed C array (UPROPERTY with a size, e.g. `FPD3AssaultDifficultySettings Array[4]`) is
+    // ONE FProperty with ArrayDim > 1, and the __index path resolves it with the property
+    // offset only -- no ArrayIndex -- so named access always lands on element 0 and the rest of
+    // the array is invisible to scripts. Found against PAYDAY 3's per-difficulty
+    // PD3AssaultSettings arrays (2026-08-30): every element past 0 was unreachable.
+    //
+    // This hands the script a struct wrapper rooted at the requested element, so every existing
+    // struct pusher (named reads/writes, nested TArray/TMap iteration) works over that element.
+    auto get_struct_array_element_implementation(const LuaMadeSimple::Lua& lua) -> int
+    {
+        std::string error_overload_not_found{R"(
+No overload found for function 'UObject.GetStructArrayElement'.
+Overloads:
+#1: GetStructArrayElement(string PropertyName, int32 ArrayIndex))"};
+
+        auto& lua_object = lua.get_userdata<UObject>();
+        auto* object = lua_object.get_remote_cpp_object();
+
+        // get_userdata above REMOVED the self userdata from the stack (preserve_stack=false),
+        // so the parameters sit at 1 and 2, not 2 and 3.
+        if (!lua.is_string(1) || !lua.is_integer(2))
+        {
+            lua.throw_error(error_overload_not_found);
+        }
+        if (!object)
+        {
+            lua.set_nil();
+            return 1;
+        }
+
+        // get_integer/get_string REMOVE the slot they read (LuaMadeSimple::Lua::get_*), so the
+        // later of the two arguments must be fetched FIRST or the removal shifts the stack and
+        // the other read lands on an empty slot -- which is exactly how the first build read
+        // every index as 0 and silently resolved every element call to element 0.
+        const auto array_index = static_cast<int32_t>(lua.get_integer(2));
+        const auto property_name = ensure_str(lua.get_string(1));
+
+        auto* obj_as_struct = Unreal::Cast<Unreal::UStruct>(object);
+        if (!obj_as_struct)
+        {
+            obj_as_struct = object->GetClassPrivate();
+        }
+        auto* field = obj_as_struct->FindProperty(Unreal::FName(property_name, Unreal::FNAME_Find));
+
+        auto* struct_property = field ? Unreal::CastField<Unreal::FStructProperty>(field) : nullptr;
+        if (!struct_property)
+        {
+            Output::send(STR("[Lua][Error] GetStructArrayElement: '{}' is not a struct property on this object\n"), property_name);
+            lua.set_nil();
+            return 1;
+        }
+
+        const int32_t array_dim = std::max(struct_property->GetArrayDim(), 1);
+        if (array_index < 0 || array_index >= array_dim)
+        {
+            Output::send(STR("[Lua][Error] GetStructArrayElement: index {} out of bounds for '{}' (0..{})\n"),
+                         array_index, property_name, array_dim - 1);
+            lua.set_nil();
+            return 1;
+        }
+
+        // Manual offset math rather than ContainerPtrToValuePtr: the template's internal checks
+        // (owner-class asserts) buy nothing here and a failed check takes the process down.
+        auto* element_data = static_cast<uint8_t*>(static_cast<void*>(object))
+                + struct_property->GetOffset_ForInternal()
+                + static_cast<size_t>(struct_property->GetSize() / array_dim) * array_index;
+
+        auto property_value = ScriptStructWrapper{struct_property->GetStruct(), element_data, struct_property};
+        UScriptStruct::construct(lua, property_value);
+        return 1;
+    }
+
     auto handle_unreal_property_value(
             const Operation operation, const LuaMadeSimple::Lua& lua, Unreal::UObject* base, Unreal::FName property_name, Unreal::FField* field) -> void
     {
