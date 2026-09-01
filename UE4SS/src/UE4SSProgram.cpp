@@ -38,6 +38,7 @@
 #include <Signatures.hpp>
 #include <Timer/ScopedTimer.hpp>
 #include <MCP/MCPServer.hpp>
+#include <NativeHook.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/AGameMode.hpp>
 #include <Unreal/AGameModeBase.hpp>
@@ -458,6 +459,9 @@ namespace RC
         // Before anything else: this releases MCP clients blocked waiting on the game thread,
         // which will never be serviced again once we start tearing down.
         MCP::MCPServer::stop();
+
+        // Drop Lua-installed native detours while the game module is still mapped.
+        NativeHook::uninstall_all();
 
         // Shut down the event loop
         m_processing_events = false;

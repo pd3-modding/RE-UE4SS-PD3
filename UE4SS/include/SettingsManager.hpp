@@ -141,6 +141,15 @@ namespace RC
             int64_t GameThreadTimeoutMs{10000};
         } MCP;
 
+        // Lua-installable detours on arbitrary native addresses (RegisterNativeHook). Nothing is
+        // hooked until a mod asks for it, so leaving this enabled costs nothing -- but it is the
+        // switch that turns off every such hook at once if one of them is destabilising the game.
+        // See UE4SS/include/NativeHook.hpp.
+        struct SectionNativeHooks
+        {
+            bool Enabled{true};
+        } NativeHooks;
+
         struct ExperimentalFeatures
         {
         } Experimental;

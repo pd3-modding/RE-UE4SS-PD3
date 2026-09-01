@@ -2,12 +2,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -26,6 +31,8 @@
 #include <LuaType/LuaFOutputDevice.hpp>
 #include <LuaType/LuaModRef.hpp>
 #include <LuaType/LuaUClass.hpp>
+#include <LuaType/LuaXProperty.hpp>
+#include <NativeHook.hpp>
 #include <LuaType/LuaUObject.hpp>
 #include <LuaType/LuaFURL.hpp>
 #include <LuaType/LuaThreadId.hpp>
@@ -1221,6 +1228,19 @@ namespace RC
             }
         }
     }
+
+    // Lua callbacks attached to a NativeHook id. Keyed by id because NativeHook::install folds a
+    // second registration on the same address into the same hook, so several mods can share one
+    // detour and each still gets called.
+    struct NativeHookLuaCallback
+    {
+        const LuaMadeSimple::Lua* lua{};
+        int32_t registry_index{};
+        std::string owner{};
+    };
+
+    static std::mutex s_native_hook_mutex{};
+    static std::unordered_map<int32_t, std::vector<NativeHookLuaCallback>> s_native_hook_callbacks{};
 
     auto static setup_lua_global_functions_internal(const LuaMadeSimple::Lua& lua, Mod::IsTrueMod is_true_mod) -> void
     {
@@ -2500,6 +2520,276 @@ Overloads:
                     .instance_of_class = nullptr,
                     .registry_indexes = {std::pair<const LuaMadeSimple::Lua*, LuaMod::LuaCallbackData::RegistryIndex>{hook_lua, lua_callback_registry_index}}});
 
+            return 0;
+        });
+
+        // Detour an arbitrary native function by address and call back into Lua.
+        //
+        // This is the general form of RegisterLoadMapPreHook and the ~20 hooks like it: each of
+        // those is a hand-written binding to one known function, this one takes the address as
+        // data. It reaches engine code that has no reflection data and so cannot be hooked with
+        // RegisterHook, which is UFunction-only.
+        //
+        //   local id = RegisterNativeHook({
+        //       Name    = "RegisterReplicatedLifetimeProperty",
+        //       RVA     = 0x038B1828,
+        //       Pattern = "48 85 C9 74 ?? 48 89 5C 24 08",
+        //   }, function(a1, a2, a3, a4)
+        //       return nil, nil, patched   -- nil leaves that argument alone
+        //   end)
+        //
+        // The callback gets the four Win64 integer argument registers (RCX, RDX, R8, R9) as Lua
+        // integers and may return up to four replacements. ONLY functions taking at most four
+        // integer/pointer arguments and returning an integer or nothing can be hooked. Float
+        // arguments, a fifth argument, or a struct return will corrupt the call, and nothing here
+        // can detect that -- you have to know the target's signature.
+        //
+        // The callback runs on whatever thread the target runs on, inside whatever engine call
+        // path it lives in. Hook cold functions: a target that fires every frame marshals into
+        // Lua every frame, which is how a previous experiment on this project crashed the game.
+        lua.register_function("RegisterNativeHook", [](const LuaMadeSimple::Lua& lua) -> int {
+            std::string error_overload_not_found{R"(
+No overload found for function 'RegisterNativeHook'.
+Overloads:
+#1: RegisterNativeHook(table Spec, LuaFunction Callback)
+    Spec: { Name = string, RVA = integer (optional), Pattern = string (optional) })"};
+
+            if (!lua.is_table())
+            {
+                lua.throw_error(error_overload_not_found);
+            }
+
+            auto spec_table = lua.get_table();
+
+            NativeHook::Spec spec{};
+            spec.name = std::string{spec_table.get_string_field("Name")};
+            if (spec_table.does_field_exist("RVA"))
+            {
+                spec.rva = static_cast<size_t>(spec_table.get_int_field("RVA"));
+            }
+            if (spec_table.does_field_exist("Pattern"))
+            {
+                spec.pattern = std::string{spec_table.get_string_field("Pattern")};
+            }
+            if (spec.name.empty())
+            {
+                lua.throw_error("Parameter #1 for function 'RegisterNativeHook' must have a non-empty 'Name'");
+            }
+
+            if (!lua.is_function())
+            {
+                lua.throw_error(error_overload_not_found);
+            }
+
+            auto* mod = get_mod_ref(lua);
+            auto hook_lua = get_hook_lua(mod);
+
+            // Move the callback into the hook state: it fires from the game thread, not from the
+            // state that registered it.
+            lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+            const int32_t registry_index = hook_lua->registry().make_ref();
+
+            // The dispatcher needs the id, which install() has not returned yet. It cannot fire
+            // before install() returns, so filling the holder afterwards is safe.
+            auto id_holder = std::make_shared<int32_t>(-1);
+
+            const auto hook_id = NativeHook::install(spec, [id_holder](uint64_t args[4]) {
+                std::vector<NativeHookLuaCallback> callbacks{};
+                {
+                    std::scoped_lock guard{s_native_hook_mutex};
+                    auto it = s_native_hook_callbacks.find(*id_holder);
+                    if (it == s_native_hook_callbacks.end())
+                    {
+                        return;
+                    }
+                    callbacks = it->second;
+                }
+
+                for (const auto& callback : callbacks)
+                {
+                    if (!callback.lua)
+                    {
+                        continue;
+                    }
+                    const auto& callback_lua = *callback.lua;
+                    std::lock_guard<std::recursive_mutex> thread_guard{LuaMod::m_thread_actions_mutex};
+                    auto* lua_state = callback_lua.get_lua_state();
+                    // Taken outside TRY and restored after it: a callback that throws would
+                    // otherwise leave its arguments on the stack, once per call, until overflow.
+                    const int stack_base = lua_gettop(lua_state);
+                    TRY([&] {
+                        callback_lua.registry().get_function_ref(callback.registry_index);
+                        for (size_t i = 0; i < 4; ++i)
+                        {
+                            callback_lua.set_integer(static_cast<int64_t>(args[i]));
+                        }
+                        callback_lua.call_function(4, 4);
+
+                        // Chain: a replacement returned by one callback is what the next one sees,
+                        // and what the original is finally called with.
+                        for (int i = 0; i < 4; ++i)
+                        {
+                            const int stack_index = stack_base + 1 + i;
+                            if (lua_isinteger(lua_state, stack_index))
+                            {
+                                args[i] = static_cast<uint64_t>(lua_tointeger(lua_state, stack_index));
+                            }
+                        }
+                    });
+                    lua_settop(lua_state, stack_base);
+                }
+            });
+
+            if (hook_id < 0)
+            {
+                // The registry reference leaks here. LuaMadeSimple's Registry has make_ref but no
+                // unref, and this is a failure path taken once at most, so it is not worth
+                // widening that API for.
+                lua.set_integer(-1);
+                return 1;
+            }
+
+            *id_holder = hook_id;
+            {
+                std::scoped_lock guard{s_native_hook_mutex};
+                s_native_hook_callbacks[hook_id].emplace_back(
+                        NativeHookLuaCallback{.lua = hook_lua, .registry_index = registry_index, .owner = to_string(mod->get_name())});
+            }
+
+            lua.set_integer(hook_id);
+            return 1;
+        });
+
+        // Removes every callback this mod attached to the hook, and the detour itself once no
+        // callbacks are left. Call from RegisterModUnload -- a reload otherwise leaves a detour
+        // pointing at a registry index that no longer exists.
+        lua.register_function("UnregisterNativeHook", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'UnregisterNativeHook' must be a hook id");
+            }
+            const auto hook_id = static_cast<int32_t>(lua.get_integer());
+            auto* mod = get_mod_ref(lua);
+            const auto owner = to_string(mod->get_name());
+
+            bool now_empty{};
+            {
+                std::scoped_lock guard{s_native_hook_mutex};
+                auto it = s_native_hook_callbacks.find(hook_id);
+                if (it != s_native_hook_callbacks.end())
+                {
+                    std::erase_if(it->second, [&](const NativeHookLuaCallback& callback) {
+                        return callback.owner == owner;
+                    });
+                    now_empty = it->second.empty();
+                    if (now_empty)
+                    {
+                        s_native_hook_callbacks.erase(it);
+                    }
+                }
+            }
+
+            if (now_empty)
+            {
+                NativeHook::uninstall(hook_id);
+            }
+            lua.set_bool(true);
+            return 1;
+        });
+
+        // How many times the hooked function has been called. 0 with a valid id means the detour
+        // is installed but that code path never ran -- almost always a timing mistake (an
+        // FRepLayout already built, a hook registered after the event) rather than a bad address.
+        lua.register_function("GetNativeHookCallCount", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'GetNativeHookCallCount' must be a hook id");
+            }
+            lua.set_integer(static_cast<int64_t>(NativeHook::call_count(static_cast<int32_t>(lua.get_integer()))));
+            return 1;
+        });
+
+        // Wraps a raw address as an FProperty so a native hook that receives one can read its
+        // name and owner (GetFullName() returns "Type /Script/Pkg.Class:Property"). Returns nil
+        // for a null address. It CANNOT check that the address really is an FProperty -- passing
+        // anything else is an access violation that pcall will not catch.
+        lua.register_function("NativeToProperty", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'NativeToProperty' must be an address");
+            }
+            auto* property = std::bit_cast<Unreal::FProperty*>(static_cast<uintptr_t>(lua.get_integer()));
+            if (!property)
+            {
+                lua.set_nil();
+                return 1;
+            }
+            LuaType::auto_construct_property(lua, property);
+            return 1;
+        });
+
+        // Raw memory, for building the struct a hooked function should see instead of the one it
+        // was given. Every one of these will crash the game on a bad address, uncatchably.
+        // NativeAlloc memory is the caller's to NativeFree; it is not tracked per mod.
+        lua.register_function("NativeAlloc", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'NativeAlloc' must be a size");
+            }
+            const auto size = static_cast<size_t>(lua.get_integer());
+            lua.set_integer(size == 0 ? 0 : std::bit_cast<int64_t>(std::calloc(1, size)));
+            return 1;
+        });
+
+        lua.register_function("NativeFree", [](const LuaMadeSimple::Lua& lua) -> int {
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'NativeFree' must be an address");
+            }
+            std::free(std::bit_cast<void*>(static_cast<uintptr_t>(lua.get_integer())));
+            return 0;
+        });
+
+        lua.register_function("NativeCopy", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto destination = static_cast<uintptr_t>(lua.get_integer());
+            const auto source = static_cast<uintptr_t>(lua.get_integer());
+            const auto size = static_cast<size_t>(lua.get_integer());
+            if (destination && source && size)
+            {
+                std::memcpy(std::bit_cast<void*>(destination), std::bit_cast<void*>(source), size);
+            }
+            return 0;
+        });
+
+        lua.register_function("NativeReadI32", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto address = static_cast<uintptr_t>(lua.get_integer());
+            lua.set_integer(address ? *std::bit_cast<int32_t*>(address) : 0);
+            return 1;
+        });
+
+        lua.register_function("NativeWriteI32", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto address = static_cast<uintptr_t>(lua.get_integer());
+            const auto value = static_cast<int32_t>(lua.get_integer());
+            if (address)
+            {
+                *std::bit_cast<int32_t*>(address) = value;
+            }
+            return 0;
+        });
+
+        lua.register_function("NativeReadU64", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto address = static_cast<uintptr_t>(lua.get_integer());
+            lua.set_integer(address ? static_cast<int64_t>(*std::bit_cast<uint64_t*>(address)) : 0);
+            return 1;
+        });
+
+        lua.register_function("NativeWriteU64", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto address = static_cast<uintptr_t>(lua.get_integer());
+            const auto value = static_cast<uint64_t>(lua.get_integer());
+            if (address)
+            {
+                *std::bit_cast<uint64_t*>(address) = value;
+            }
             return 0;
         });
 

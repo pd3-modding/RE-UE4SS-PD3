@@ -224,6 +224,9 @@ namespace RC
         REGISTER_INT64_SETTING(MCP.Port, section_mcp, Port)
         REGISTER_INT64_SETTING(MCP.GameThreadTimeoutMs, section_mcp, GameThreadTimeoutMs)
 
+        constexpr static File::CharType section_native_hooks[] = STR("NativeHooks");
+        REGISTER_BOOL_SETTING(NativeHooks.Enabled, section_native_hooks, Enabled)
+
         constexpr static File::CharType section_experimental_features[] = STR("ExperimentalFeatures");
     }
 } // namespace RC
