@@ -738,6 +738,15 @@ namespace RC::LuaType
             {
                 // StructData as userdata
                 auto& lua_scriptstruct = params.lua.get_userdata<UScriptStruct>().get_local_cpp_object();
+                // Validate before ANY deref of the source's script_struct: a wrapper from a
+                // TrivialObject chain arrives here with a garbage pointer, and GetName() on it
+                // was an uncatchable AV (crashed writing a brush into a nested style struct,
+                // 2026-09-02). Report the target type only; never deref the source on mismatch.
+                if (lua_scriptstruct.script_struct == nullptr)
+                {
+                    params.throw_error("push_structproperty::lua_to_memory",
+                                       "Can't copy struct: source wrapper carries no script struct");
+                }
                 if (lua_scriptstruct.script_struct == script_struct)
                 {
                     struct_property->CopyCompleteValue(params.data, lua_scriptstruct.get_data_ptr());
@@ -745,8 +754,7 @@ namespace RC::LuaType
                 else
                 {
                     params.throw_error("push_structproperty::lua_to_memory",
-                                       fmt::format("Can't copy struct of type {} into {}",
-                                                   to_string(lua_scriptstruct.script_struct->GetName()),
+                                       fmt::format("Can't copy struct: source struct type does not match target '{}'",
                                                    to_string(script_struct->GetName())));
                 }
             }
@@ -1641,6 +1649,14 @@ namespace RC::LuaType
             LuaType::FName::construct(params.lua, *name);
             return;
         case Operation::Set: {
+            // Accept a plain Lua string by constructing the FName. The unchecked userdata
+            // cast below otherwise reinterprets the string's bytes as an FName and AVs with
+            // no way for a script to catch it (crashed a UFunction FName arg, 2026-09-01).
+            if (params.lua.is_string(params.stored_at_index))
+            {
+                *name = Unreal::FName{ensure_str(params.lua.get_string(params.stored_at_index))};
+                return;
+            }
             auto& lua_object = params.lua.get_userdata<LuaType::FName>(params.stored_at_index);
             *name = lua_object.get_local_cpp_object();
             return;
@@ -1671,6 +1687,16 @@ namespace RC::LuaType
             LuaType::FText::construct(params.lua, *text);
             return;
         case Operation::Set: {
+            // Accept a plain Lua string by converting it to an FText. The unchecked userdata
+            // cast below otherwise reinterprets the string's bytes as an FText and AVs with
+            // no way for a script to catch it — this fired from inside
+            // convert_lua_table_to_struct, where a Lua-table struct literal passed a string
+            // for an FText field (crashed DisplayHUDNotification, 2026-09-02).
+            if (params.lua.is_string(params.stored_at_index))
+            {
+                text->SetString(Unreal::FString{ensure_str(params.lua.get_string(params.stored_at_index))});
+                return;
+            }
             auto& lua_other_object = params.lua.get_userdata<LuaType::FText>(params.stored_at_index);
             text->SetString(std::move(lua_other_object.get_local_cpp_object().ToFString()));
             return;
@@ -1828,6 +1854,15 @@ namespace RC::LuaType
             LuaType::TSoftObjectPtr::construct(params.lua, *soft_ptr);
             return;
         case Operation::Set: {
+            // Accept a plain Lua string as an asset soft path. FSoftObjectPath stores the
+            // string verbatim; nothing resolves until a load asks for it. The unchecked
+            // userdata cast below otherwise reinterprets the string's bytes as a
+            // TSoftObjectPtr and AVs uncatchably (the LWI StaticMesh crash family).
+            if (params.lua.is_string(params.stored_at_index))
+            {
+                *soft_ptr = Unreal::FSoftObjectPtr{Unreal::FSoftObjectPath{Unreal::FString{ensure_str(params.lua.get_string(params.stored_at_index))}}};
+                return;
+            }
             auto& lua_object = params.lua.get_userdata<LuaType::TSoftObjectPtr>(params.stored_at_index);
             *soft_ptr = lua_object.get_local_cpp_object();
             return;
