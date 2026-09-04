@@ -122,6 +122,10 @@ namespace RC
         // Will be non-nullptr if the UFunction has a return value
         Unreal::FProperty* return_property{};
         std::atomic<bool> scheduled_for_removal{false};
+        // The owning mod is being uninstalled, as opposed to Lua having called UnregisterHook.
+        // Both mean "this hook is going away", but they must be torn down by DIFFERENT threads:
+        // see the early-out in lua_unreal_script_function_hook_post's remove_if_scheduled.
+        std::atomic<bool> mod_unloading{false};
 
         LuaUnrealScriptFunctionData(Unreal::CallbackId pre_id,
                                     Unreal::CallbackId post_id,
@@ -137,6 +141,20 @@ namespace RC
         }
     };
     static std::vector<std::unique_ptr<LuaUnrealScriptFunctionData>> g_hooked_script_function_data{};
+
+    // GUARDS THE VECTOR ABOVE. It is global and written from two threads: the game thread
+    // registers hooks lazily (a widget appears, a mod hooks its function) and erases them when
+    // Lua unregisters one, while the unload thread walks the whole vector in LuaMod::uninstall.
+    // Both mutations move elements -- emplace_back on reallocation, erase_if on removal -- and a
+    // moved-from unique_ptr is NULL, so a concurrent walker reads `item->mod` off address 0.
+    // That is the 2026-09-04 10:06 reload crash exactly: PD3M!RC::LuaMod::uninstall+0x693,
+    // `mov rbx,[rcx+10h]` with rcx=0, on the vector's last element. The log names the other
+    // thread 0.5 ms earlier -- "Unregistering native pre-hook (3)" is the game thread inside
+    // remove_if_scheduled, printed in the middle of the unload thread's unregister loop.
+    //
+    // Lock ordering: this mutex is always taken INSIDE m_thread_actions_mutex and always taken
+    // BEFORE UFunction::(Un)RegisterHook's own registry lock. Never take it around Lua.
+    static std::mutex g_hooked_script_function_data_mutex{};
 
     // Raised for as long as a hook callback is inside one mod's Lua state, so uninstall() can wait
     // for the room to empty before running fire_on_mod_unload()'s Lua in the same state. See
@@ -275,6 +293,21 @@ namespace RC
 
         // Returns true if a hooks were removed.
         auto remove_if_scheduled = [&] -> bool {
+            // THE MOD IS BEING UNINSTALLED: do nothing at all, and above all do not touch the
+            // container or the Lua state. uninstall() unregisters these hooks itself, erases
+            // their data itself, and lua_close() releases every registry ref -- so everything
+            // below is not merely redundant here, it is the same work done from the wrong
+            // thread. Doing it anyway is what crashed the 10:06 reload (see the note on
+            // g_hooked_script_function_data_mutex): the flag that says "stop running Lua" was
+            // also routing every firing of a hot hook straight into a concurrent erase_if.
+            // ForceLayoutPrepass fires every frame while menus lay out, so the collision was
+            // near enough guaranteed rather than unlucky.
+            //
+            // Returning true still skips the callback, which is the point of the flag.
+            if (lua_data.mod_unloading)
+            {
+                return true;
+            }
             if (lua_data.scheduled_for_removal)
             {
                 const auto function_name_no_prefix = get_function_name_without_prefix(lua_data.unreal_function->GetFullName());
@@ -292,9 +325,12 @@ namespace RC
 
                 const auto mod = get_mod_ref(lua_data.lua);
                 luaL_unref(mod->lua().get_lua_state(), LUA_REGISTRYINDEX, lua_data.lua_thread_ref);
-                std::erase_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& elem) {
-                    return elem.get() == &lua_data;
-                });
+                {
+                    std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
+                    std::erase_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& elem) {
+                        return elem.get() == &lua_data;
+                    });
+                }
 
                 return true;
             }
@@ -1866,6 +1902,7 @@ Overloads:
                 if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
                     unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
                 {
+                    std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
                     const auto hook_data = std::ranges::find_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& elem) {
                         return elem->post_callback_id == post_id && elem->pre_callback_id == pre_id;
                     });
@@ -4638,6 +4675,9 @@ Overloads:
             if (func_ptr && func_ptr != Unreal::UObject::ProcessInternalInternal.get_function_address() &&
                 unreal_function->HasAnyFunctionFlags(Unreal::EFunctionFlags::FUNC_Native))
             {
+                // Held across the emplace AND the id write-back: the emplace can reallocate, which
+                // leaves every element of the old buffer moved-from and null for anyone walking it.
+                std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
                 auto& custom_data = g_hooked_script_function_data.emplace_back(std::make_unique<LuaUnrealScriptFunctionData>(
                         0, 0, unreal_function, mod, *hook_lua, lua_callback_registry_index, lua_post_callback_registry_index, lua_thread_registry_index));
                 pre_id = unreal_function->RegisterPreHook(&lua_unreal_script_function_hook_pre, custom_data.get());
@@ -6525,11 +6565,17 @@ Overloads:
         // need that mutex (ExecuteInGameThread and friends take it), so waiting while holding it
         // would deadlock exactly the thread being waited on -- which is the hang seen at 09:01.
         // Bounded, so a genuinely stuck callback delays the reload instead of wedging the game.
-        for (auto& item : g_hooked_script_function_data)
         {
-            if (item->mod == this)
+            std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
+            for (auto& item : g_hooked_script_function_data)
             {
-                item->scheduled_for_removal = true;
+                if (item->mod == this)
+                {
+                    // mod_unloading FIRST, so the game thread can never observe
+                    // scheduled_for_removal without it and take the erase path below us.
+                    item->mod_unloading = true;
+                    item->scheduled_for_removal = true;
+                }
             }
         }
         // Only THIS mod's counter: another mod's callback runs in another lua_State and cannot
@@ -6606,11 +6652,18 @@ Overloads:
         // Mark all hooks for this mod as scheduled_for_removal FIRST
         // This prevents hooks from firing Lua code with a potentially invalid Lua state
         // The pre-hook checks this flag and returns early if true
-        for (auto& item : g_hooked_script_function_data)
+        //
+        // Redundant since the same pass now runs before the drain above, but kept: it is the
+        // stock ordering, and a hook registered between the two passes still gets flagged here.
         {
-            if (item->mod == this)
+            std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
+            for (auto& item : g_hooked_script_function_data)
             {
-                item->scheduled_for_removal = true;
+                if (item->mod == this)
+                {
+                    item->mod_unloading = true;
+                    item->scheduled_for_removal = true;
+                }
             }
         }
 
@@ -6627,14 +6680,17 @@ Overloads:
         //
         // Note: We do NOT erase from g_hooked_script_function_data here yet, because the data
         // must remain valid in case a post-hook is still pending (the erase happens later).
-        for (auto& item : g_hooked_script_function_data)
         {
-            if (item->mod == this)
+            std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
+            for (auto& item : g_hooked_script_function_data)
             {
-                Output::send(STR("\tUnregistering hook by id '{}#{}' for mod {}\n"), item->unreal_function->GetName(), item->pre_callback_id, item->mod->get_name());
-                Output::send(STR("\tUnregistering hook by id '{}#{}' for mod {}\n"), item->unreal_function->GetName(), item->post_callback_id, item->mod->get_name());
-                item->unreal_function->UnregisterHook(item->pre_callback_id);
-                item->unreal_function->UnregisterHook(item->post_callback_id);
+                if (item->mod == this)
+                {
+                    Output::send(STR("\tUnregistering hook by id '{}#{}' for mod {}\n"), item->unreal_function->GetName(), item->pre_callback_id, item->mod->get_name());
+                    Output::send(STR("\tUnregistering hook by id '{}#{}' for mod {}\n"), item->unreal_function->GetName(), item->post_callback_id, item->mod->get_name());
+                    item->unreal_function->UnregisterHook(item->pre_callback_id);
+                    item->unreal_function->UnregisterHook(item->post_callback_id);
+                }
             }
         }
 
@@ -6699,9 +6755,12 @@ Overloads:
         // 1. We already unregistered the hooks (callbacks won't fire)
         // 2. If any post-hooks were pending, FirePostCallbacks skips them due to UnregistrationRequested
         // 3. The Lua state is closed, so we don't need to call luaL_unref
-        std::erase_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& item) {
-            return item->mod == this;
-        });
+        {
+            std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
+            std::erase_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& item) {
+                return item->mod == this;
+            });
+        }
 
         clear_delayed_actions();
     }
