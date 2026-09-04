@@ -234,7 +234,11 @@ namespace RC
         auto load_and_execute_script(const std::filesystem::path& script_path) -> bool;
         auto setup_lua_require_paths(const LuaMadeSimple::Lua& lua) const -> void;
         auto setup_lua_global_functions(const LuaMadeSimple::Lua& lua) const -> void;
-        auto setup_lua_global_functions_main_state_only() const -> void;
+        // Takes the state rather than using m_lua, so it can be installed on ANY state -- the
+        // MCP executor included. Static because nothing in it needs the mod: every body already
+        // resolves its owner from the state's ModRef global at call time, and the ones that can
+        // work without an owner now say so explicitly (see get_hook_context).
+        RC_UE4SS_API static auto setup_lua_global_functions_main_state_only(const LuaMadeSimple::Lua& lua) -> void;
         auto setup_lua_classes(const LuaMadeSimple::Lua& lua) const -> void;
         auto fire_on_lua_start_for_cpp_mods() -> void;
         auto fire_on_lua_stop_for_cpp_mods() -> void;

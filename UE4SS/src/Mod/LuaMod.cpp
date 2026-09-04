@@ -323,8 +323,14 @@ namespace RC
                     luaL_unref(lua_data.lua.get_lua_state(), LUA_REGISTRYINDEX, lua_data.lua_post_callback_ref);
                 }
 
-                const auto mod = get_mod_ref(lua_data.lua);
-                luaL_unref(mod->lua().get_lua_state(), LUA_REGISTRYINDEX, lua_data.lua_thread_ref);
+                // lua_data.mod is null for a hook registered from a state with no ModRef (the MCP
+                // executor). There is no separate hook thread in that case -- thread_ref is
+                // LUA_NOREF -- so there is nothing to unref, and calling get_mod_ref here would
+                // throw on the game thread inside a hook callback.
+                if (lua_data.mod != nullptr && lua_data.lua_thread_ref != LUA_NOREF)
+                {
+                    luaL_unref(lua_data.mod->lua().get_lua_state(), LUA_REGISTRYINDEX, lua_data.lua_thread_ref);
+                }
                 {
                     std::lock_guard<std::mutex> guard{g_hooked_script_function_data_mutex};
                     std::erase_if(g_hooked_script_function_data, [&](const std::unique_ptr<LuaUnrealScriptFunctionData>& elem) {
@@ -1333,6 +1339,39 @@ namespace RC
         }
         auto* mod = get_mod_ref(lua);
         return {get_hook_lua(mod), to_string(mod->get_name())};
+    }
+
+    // Where a UFunction hook's Lua callback lives, and who owns it. The UFunction twin of
+    // get_native_hook_context above, and it exists for the same reason: the MCP executor state is
+    // deliberately not a mod, so get_mod_ref would throw and put RegisterHook out of reach of the
+    // one tool this project uses to drive the running game.
+    //
+    // A NULL OWNER IS MEANINGFUL, not a degraded fallback. LuaMod::uninstall only ever touches
+    // entries whose `mod == this`, so an MCP-registered hook is invisible to every mod unload and
+    // survives a reload -- which is correct, because the executor state is never closed. The flip
+    // side is that nothing reclaims it either: it must be dropped with UnregisterHook.
+    struct HookContext
+    {
+        LuaMod* owner{};                      // null for the MCP executor state
+        LuaMadeSimple::Lua* callback_lua{};   // the state the callback ref lives in
+        int thread_ref{LUA_NOREF};            // LUA_NOREF when there is no separate hook thread
+        bool same_state{};                    // callback_lua IS the calling state: no lua_xmove
+    };
+
+    auto static get_hook_context(const LuaMadeSimple::Lua& lua) -> HookContext
+    {
+        auto* lua_state = lua.get_lua_state();
+        const bool has_mod_ref = lua_getglobal(lua_state, "ModRef") != LUA_TNIL;
+        lua_pop(lua_state, 1);
+        if (!has_mod_ref)
+        {
+            // No hook thread: a mod gets one so its callbacks are off the main stack and can be
+            // torn down wholesale, neither of which applies to a state that never goes away.
+            return {nullptr, const_cast<LuaMadeSimple::Lua*>(&lua), LUA_NOREF, true};
+        }
+        auto* mod = get_mod_ref(lua);
+        auto [hook_lua, thread_ref] = make_hook_state(mod);
+        return {mod, hook_lua, thread_ref, false};
     }
 
     auto static setup_lua_global_functions_internal(const LuaMadeSimple::Lua& lua, Mod::IsTrueMod is_true_mod) -> void
@@ -4616,9 +4655,14 @@ Overloads:
         }
     }
 
-    auto LuaMod::setup_lua_global_functions_main_state_only() const -> void
+    auto LuaMod::setup_lua_global_functions_main_state_only(const LuaMadeSimple::Lua& lua_state_to_setup) -> void
     {
-        m_lua.register_function("RegisterHook", [](const LuaMadeSimple::Lua& lua) -> int {
+        // `lua_state_to_setup`, not m_lua: this tier is now installable on any state. A mod passes
+        // its own; mcp_eval passes the executor state, which is how the MCP tool reaches
+        // RegisterHook at all. Bodies below resolve their owner per call from ModRef, so the only
+        // thing that changes per state is where the functions are registered.
+        const LuaMadeSimple::Lua& lua_registrar = lua_state_to_setup;
+        lua_registrar.register_function("RegisterHook", [](const LuaMadeSimple::Lua& lua) -> int {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
 
             std::string error_overload_not_found{R"(
@@ -4638,12 +4682,20 @@ Overloads:
                 lua.throw_error(error_overload_not_found);
             }
 
-            auto mod = get_mod_ref(lua);
-            auto [hook_lua, lua_thread_registry_index] = make_hook_state(mod); // operates on LuaMod::m_lua incrementing its stack via lua_newthread
+            // Null owner when the caller has no ModRef (the MCP executor): the callback then stays
+            // in the calling state, and lua_xmove is skipped because moving a value from a state
+            // to itself is not a legal move.
+            const auto hook_context = get_hook_context(lua);
+            auto* const mod = hook_context.owner;
+            auto* const hook_lua = hook_context.callback_lua;
+            const int lua_thread_registry_index = hook_context.thread_ref;
 
             // Duplicate the Lua function to the top of the stack for lua_xmove and luaL_ref
             lua_pushvalue(lua.get_lua_state(), 1); // operates on LuaMadeSimple::Lua::m_lua_state
-            lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+            if (!hook_context.same_state)
+            {
+                lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+            }
 
             // Take a reference to the Lua function (it also pops it of the stack)
             const auto lua_callback_registry_index = luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX);
@@ -4655,7 +4707,10 @@ Overloads:
                 lua.discard_value();
                 // Duplicate the second Lua function to the top of the stack for lua_xmove and luaL_ref
                 lua_pushvalue(lua.get_lua_state(), 1); // operates on LuaMadeSimple::Lua::m_lua_state
-                lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+                if (!hook_context.same_state)
+                {
+                    lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+                }
                 lua_post_callback_registry_index = luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX);
                 has_post_callback = true;
             }
@@ -4727,7 +4782,7 @@ Overloads:
 
         // Register EGameThreadMethod enum table
         {
-            lua_State* L = m_lua.get_lua_state();
+            lua_State* L = lua_registrar.get_lua_state();
             lua_newtable(L);
             lua_pushinteger(L, static_cast<int>(GameThreadExecutionMethod::EngineTick));
             lua_setfield(L, -2, "EngineTick");
@@ -4739,14 +4794,14 @@ Overloads:
         // Register capability globals
         // These indicate whether certain hooks are available (scan succeeded)
         {
-            lua_State* L = m_lua.get_lua_state();
+            lua_State* L = lua_registrar.get_lua_state();
             lua_pushboolean(L, UE4SSRuntime::IsEngineTickAvailable());
             lua_setglobal(L, "EngineTickAvailable");
             lua_pushboolean(L, UE4SSRuntime::IsProcessEventAvailable());
             lua_setglobal(L, "ProcessEventAvailable");
         }
 
-        m_lua.register_function("ExecuteInGameThread", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("ExecuteInGameThread", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'ExecuteInGameThread'.
 Overloads:
@@ -4829,7 +4884,7 @@ Overloads:
 
         // ExecuteInGameThreadWithDelay - executes callback after a time delay
         // Uses default method from config, falls back to the other if unavailable
-        m_lua.register_function("ExecuteInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("ExecuteInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'ExecuteInGameThreadWithDelay'.
 Overloads:
@@ -4975,7 +5030,7 @@ Overloads:
 
         // RetriggerableExecuteInGameThreadWithDelay - executes callback after a time delay, resets timer if called again with same handle
         // Uses default method from config, falls back to the other if unavailable
-        m_lua.register_function("RetriggerableExecuteInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("RetriggerableExecuteInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'RetriggerableExecuteInGameThreadWithDelay'.
 Overloads:
@@ -5082,7 +5137,7 @@ Overloads:
 
         // ExecuteInGameThreadAfterFrames - executes callback after a frame delay
         // Requires EngineTick hook - cannot fall back to ProcessEvent since frames cannot be counted there
-        m_lua.register_function("ExecuteInGameThreadAfterFrames", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("ExecuteInGameThreadAfterFrames", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'ExecuteInGameThreadAfterFrames'.
 Overloads:
@@ -5137,7 +5192,7 @@ Overloads:
 
         // LoopInGameThreadWithDelay - executes callback repeatedly with a time delay
         // Uses default method from config, falls back to the other if unavailable
-        m_lua.register_function("LoopInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("LoopInGameThreadWithDelay", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'LoopInGameThreadWithDelay'.
 Overloads:
@@ -5217,7 +5272,7 @@ Overloads:
 
         // LoopInGameThreadAfterFrames - executes callback repeatedly with a frame delay
         // Requires EngineTick hook - cannot fall back to ProcessEvent since frames cannot be counted there
-        m_lua.register_function("LoopInGameThreadAfterFrames", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("LoopInGameThreadAfterFrames", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'LoopInGameThreadAfterFrames'.
 Overloads:
@@ -5273,7 +5328,7 @@ Overloads:
         });
 
         // ResetDelayedActionTimer - resets the timer for any delayed action using the original delay (only if owned by calling mod)
-        m_lua.register_function("ResetDelayedActionTimer", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("ResetDelayedActionTimer", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'ResetDelayedActionTimer'.
 Overloads:
@@ -5337,7 +5392,7 @@ Overloads:
         });
 
         // SetDelayedActionTimer - sets a new delay for a delayed action and restarts the timer (only if owned by calling mod)
-        m_lua.register_function("SetDelayedActionTimer", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("SetDelayedActionTimer", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'SetDelayedActionTimer'.
 Overloads:
@@ -5407,7 +5462,7 @@ Overloads:
         });
 
         // PauseDelayedAction - pauses a delayed action timer (only if owned by calling mod)
-        m_lua.register_function("PauseDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("PauseDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'PauseDelayedAction'.
 Overloads:
@@ -5486,7 +5541,7 @@ Overloads:
         });
 
         // UnpauseDelayedAction - resumes a paused delayed action timer (only if owned by calling mod)
-        m_lua.register_function("UnpauseDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("UnpauseDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'UnpauseDelayedAction'.
 Overloads:
@@ -5536,7 +5591,7 @@ Overloads:
         });
 
         // CancelDelayedAction - cancels a delayed action (only if owned by calling mod)
-        m_lua.register_function("CancelDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("CancelDelayedAction", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'CancelDelayedAction'.
 Overloads:
@@ -5583,7 +5638,7 @@ Overloads:
         });
 
         // IsValidDelayedActionHandle - checks if a handle refers to an existing, non-cancelled action
-        m_lua.register_function("IsValidDelayedActionHandle", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("IsValidDelayedActionHandle", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'IsValidDelayedActionHandle'.
 Overloads:
@@ -5625,7 +5680,7 @@ Overloads:
         });
 
         // IsDelayedActionActive - checks if a delayed action is active (not paused or cancelled)
-        m_lua.register_function("IsDelayedActionActive", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("IsDelayedActionActive", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'IsDelayedActionActive'.
 Overloads:
@@ -5667,7 +5722,7 @@ Overloads:
         });
 
         // IsDelayedActionPaused - checks if a delayed action is paused
-        m_lua.register_function("IsDelayedActionPaused", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("IsDelayedActionPaused", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'IsDelayedActionPaused'.
 Overloads:
@@ -5709,7 +5764,7 @@ Overloads:
         });
 
         // GetDelayedActionTimeRemaining - returns remaining time in milliseconds (or frames for frame-based)
-        m_lua.register_function("GetDelayedActionTimeRemaining", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("GetDelayedActionTimeRemaining", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'GetDelayedActionTimeRemaining'.
 Overloads:
@@ -5792,7 +5847,7 @@ Overloads:
         });
 
         // GetDelayedActionTimeElapsed - returns elapsed time in milliseconds (or frames for frame-based)
-        m_lua.register_function("GetDelayedActionTimeElapsed", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("GetDelayedActionTimeElapsed", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'GetDelayedActionTimeElapsed'.
 Overloads:
@@ -5877,7 +5932,7 @@ Overloads:
         });
 
         // GetDelayedActionRate - returns the configured delay rate (not remaining time)
-        m_lua.register_function("GetDelayedActionRate", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("GetDelayedActionRate", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'GetDelayedActionRate'.
 Overloads:
@@ -5935,7 +5990,7 @@ Overloads:
         });
 
         // ClearAllDelayedActions - cancels all delayed actions for the current mod
-        m_lua.register_function("ClearAllDelayedActions", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("ClearAllDelayedActions", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'ClearAllDelayedActions'.
 Overloads:
@@ -5972,7 +6027,7 @@ Overloads:
         });
 
         // MakeHandle - returns a unique action handle
-        m_lua.register_function("MakeActionHandle", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("MakeActionHandle", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'MakeActionHandle'.
 Overloads:
@@ -5983,7 +6038,7 @@ Overloads:
             return 1;
         });
 
-        m_lua.register_function("RestartCurrentMod", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("RestartCurrentMod", [](const LuaMadeSimple::Lua& lua) -> int {
             auto mod = get_mod_ref(lua);
             if (!mod)
             {
@@ -5997,7 +6052,7 @@ Overloads:
             return 0;
         });
 
-        m_lua.register_function("UninstallCurrentMod", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("UninstallCurrentMod", [](const LuaMadeSimple::Lua& lua) -> int {
             auto mod = get_mod_ref(lua);
             if (!mod)
             {
@@ -6012,7 +6067,7 @@ Overloads:
         });
 
         // P1: string mod_name - Name of the mod to restart
-        m_lua.register_function("RestartMod", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("RestartMod", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'RestartMod'.
 Overloads:
@@ -6029,7 +6084,7 @@ Overloads:
         });
 
         // P1: string mod_name - Name of the mod to uninstall
-        m_lua.register_function("UninstallMod", [](const LuaMadeSimple::Lua& lua) -> int {
+        lua_registrar.register_function("UninstallMod", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'UninstallMod'.
 Overloads:
@@ -6466,7 +6521,7 @@ Overloads:
 
             prepare_mod(lua());
             make_main_state(this, lua());
-            setup_lua_global_functions_main_state_only();
+            setup_lua_global_functions_main_state_only(m_lua);
             make_async_state(this, lua());
             start_async_thread();
 
@@ -6846,6 +6901,14 @@ Overloads:
             s_mcp_executor = &LuaMadeSimple::new_state();
             s_mcp_executor->open_all_libs();
             setup_lua_global_functions_internal(*s_mcp_executor, LuaMod::IsTrueMod::No);
+            // The mod-scoped tier, on a state that is not a mod. Everything in it resolves its
+            // owner from ModRef per call, and the ones that can work without an owner now do
+            // (get_hook_context) -- so RegisterHook reaches the MCP tool, which is the only way to
+            // observe what a UFunction's parameters actually contain from outside a mod. The rest
+            // still throw a plain "no ModRef" error, which is the honest answer for
+            // RestartCurrentMod and friends. Nothing here is per-hook: a global added to that tier
+            // later arrives in the MCP state for free.
+            setup_lua_global_functions_main_state_only(*s_mcp_executor);
             setup_lua_classes_internal(*s_mcp_executor);
             register_input_globals(*s_mcp_executor);
             register_all_property_types(*s_mcp_executor);
