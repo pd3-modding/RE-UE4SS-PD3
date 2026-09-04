@@ -193,6 +193,29 @@ namespace RC
         std::mutex m_actions_lock{};
 
       public:
+        // Hook callbacks currently executing Lua IN THIS MOD'S STATE.
+        //
+        // scheduled_for_removal stops a hook callback from ENTERING a Lua state, but says
+        // nothing about one already inside it, and there was no way to wait for that. So
+        // uninstall() could set the flag, unregister, and then run fire_on_mod_unload()'s Lua in
+        // a state the game thread was still executing -- two OS threads in one lua_State, whose
+        // stack, GC and string table are all unsynchronised. The result is a stack slot that
+        // should hold a closure holding something else; observed twice on 2026-09-04 as an AV in
+        // luaV_execute and in funcnamefromcall, each dereferencing a Proto that was really a
+        // string. The window is wide because a callback may call FindAllOf, which walks the whole
+        // UObject array and takes tens of milliseconds.
+        //
+        // PER MOD, not global. Every Lua mod has its own lua_State, so a callback running in
+        // another mod's state cannot corrupt this one and there is nothing to wait for -- but the
+        // first version of this counter was a single static, and uninstall_mods() unloads mods one
+        // at a time, so ONE callback that never finished made all 19 mods burn the full deadline:
+        // a 38-second reload (2026-09-04). Per-mod, the wait is bounded by the mod that actually
+        // has a callback inside it, and the timeout line names it.
+        //
+        // Incremented BEFORE the removal flag is tested (see lua_unreal_script_function_hook_pre)
+        // so a drain can never observe zero while a callback is on its way in.
+        std::atomic<int32_t> m_hook_callbacks_in_flight{0};
+
         LuaMod(UE4SSProgram&, StringType&& mod_name, StringType&& mod_path);
         ~LuaMod() override = default;
 

@@ -110,7 +110,9 @@ namespace RC
         Unreal::CallbackId pre_callback_id;
         Unreal::CallbackId post_callback_id;
         Unreal::UFunction* unreal_function;
-        const Mod* mod;
+        // LuaMod*, not const Mod*: the drain in uninstall() needs the owning mod's in-flight
+        // counter, and every entry here is created from get_mod_ref(), which returns a LuaMod*.
+        LuaMod* mod;
         const LuaMadeSimple::Lua& lua;
         const int lua_callback_ref;
         const int lua_post_callback_ref;
@@ -124,7 +126,7 @@ namespace RC
         LuaUnrealScriptFunctionData(Unreal::CallbackId pre_id,
                                     Unreal::CallbackId post_id,
                                     Unreal::UFunction* func,
-                                    const Mod* m,
+                                    LuaMod* m,
                                     const LuaMadeSimple::Lua& l,
                                     int cb_ref,
                                     int post_cb_ref,
@@ -136,11 +138,37 @@ namespace RC
     };
     static std::vector<std::unique_ptr<LuaUnrealScriptFunctionData>> g_hooked_script_function_data{};
 
+    // Raised for as long as a hook callback is inside one mod's Lua state, so uninstall() can wait
+    // for the room to empty before running fire_on_mod_unload()'s Lua in the same state. See
+    // LuaMod::m_hook_callbacks_in_flight for why that wait exists and why the count is per mod.
+    struct ScopedHookCallback
+    {
+        LuaMod* mod;
+        explicit ScopedHookCallback(LuaMod* m) : mod(m)
+        {
+            if (mod) mod->m_hook_callbacks_in_flight.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~ScopedHookCallback()
+        {
+            if (mod) mod->m_hook_callbacks_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ScopedHookCallback(const ScopedHookCallback&) = delete;
+        ScopedHookCallback& operator=(const ScopedHookCallback&) = delete;
+    };
+
     static auto lua_unreal_script_function_hook_pre(Unreal::UnrealScriptFunctionCallableContext context, void* custom_data) -> void
     {
         TRY([&]() {
             // Fetch the data corresponding to this UFunction
             auto& lua_data = *static_cast<LuaUnrealScriptFunctionData*>(custom_data);
+
+            // Announce that this callback is inside the Lua state BEFORE testing the removal
+            // flag, never after. uninstall() sets the flag and then waits for this counter to
+            // reach zero; ordered this way, the two possible interleavings are both safe --
+            // either the drain sees this callback and waits for it, or this callback sees the
+            // flag and leaves without touching Lua. Reversing them allows the drain to observe
+            // zero while this thread is a few instructions from entering the state.
+            ScopedHookCallback in_flight_guard{lua_data.mod};
 
             // Check if this hook has been scheduled for removal (Lua state may be invalid)
             if (lua_data.scheduled_for_removal) return;
@@ -281,6 +309,11 @@ namespace RC
         {
             return;
         }
+
+        // Same barrier as the pre-hook: the post callback runs Lua in the same state, so
+        // uninstall()'s drain has to see it too. remove_if_scheduled() has already returned
+        // above for a hook being torn down, so reaching here means this one is still live.
+        ScopedHookCallback in_flight_guard{lua_data.mod};
 
         TRY([&]() {
             auto process_return_value = [&]() {
@@ -1241,6 +1274,30 @@ namespace RC
 
     static std::mutex s_native_hook_mutex{};
     static std::unordered_map<int32_t, std::vector<NativeHookLuaCallback>> s_native_hook_callbacks{};
+
+    // Which Lua state a native-hook callback lives in, and the owner string it is unregistered by.
+    //
+    // Normally the mod's dedicated hook state. But the MCP executor state is deliberately not a mod
+    // (mcp_eval builds it with IsTrueMod::No and never sets a ModRef global), and get_mod_ref throws
+    // on a missing ModRef -- which would put the whole native-hook API out of reach of the one tool
+    // this project uses to drive the running game. So fall back to the calling state itself.
+    //
+    // Safe for the MCP state specifically: it is only ever run from the game thread (mcp_eval is
+    // serviced from the engine tick), so a callback firing there races nothing, and a hook that
+    // fires during an in-flight eval is ordinary Lua->C->Lua nesting, which the dispatcher already
+    // handles by saving and restoring the stack around the call.
+    auto static get_native_hook_context(const LuaMadeSimple::Lua& lua) -> std::pair<LuaMadeSimple::Lua*, std::string>
+    {
+        auto* lua_state = lua.get_lua_state();
+        const bool has_mod_ref = lua_getglobal(lua_state, "ModRef") != LUA_TNIL;
+        lua_pop(lua_state, 1);
+        if (!has_mod_ref)
+        {
+            return {const_cast<LuaMadeSimple::Lua*>(&lua), std::string{"<mcp>"}};
+        }
+        auto* mod = get_mod_ref(lua);
+        return {get_hook_lua(mod), to_string(mod->get_name())};
+    }
 
     auto static setup_lua_global_functions_internal(const LuaMadeSimple::Lua& lua, Mod::IsTrueMod is_true_mod) -> void
     {
@@ -2554,39 +2611,52 @@ Overloads:
 #1: RegisterNativeHook(table Spec, LuaFunction Callback)
     Spec: { Name = string, RVA = integer (optional), Pattern = string (optional) })"};
 
-            if (!lua.is_table())
+            auto* lua_state = lua.get_lua_state();
+
+            if (!lua.is_table(1))
+            {
+                lua.throw_error(error_overload_not_found);
+            }
+            // Explicit index 2. is_function() defaults to force_index = 1, which is the spec table,
+            // so the defaulted call rejects every correct invocation.
+            if (!lua.is_function(2))
             {
                 lua.throw_error(error_overload_not_found);
             }
 
-            auto spec_table = lua.get_table();
-
             NativeHook::Spec spec{};
-            spec.name = std::string{spec_table.get_string_field("Name")};
-            if (spec_table.does_field_exist("RVA"))
             {
-                spec.rva = static_cast<size_t>(spec_table.get_int_field("RVA"));
-            }
-            if (spec_table.does_field_exist("Pattern"))
-            {
-                spec.pattern = std::string{spec_table.get_string_field("Pattern")};
+                // Lua::Table addresses its table relative to the TOP of the stack -- it reads a
+                // field with lua_rawget(-2) -- not by argument index. With the callback sitting
+                // above the table at index 2, every field read here dereferenced the closure as a
+                // table: a native access violation inside luaH_getshortstr that pcall cannot catch
+                // (crashed the game 2026-09-01). Push a copy of the table to the top and read that.
+                lua_pushvalue(lua_state, 1);
+                auto spec_table = lua.get_table();
+                spec.name = std::string{spec_table.get_string_field("Name")};
+                if (spec_table.does_field_exist("RVA"))
+                {
+                    spec.rva = static_cast<size_t>(spec_table.get_int_field("RVA"));
+                }
+                if (spec_table.does_field_exist("Pattern"))
+                {
+                    spec.pattern = std::string{spec_table.get_string_field("Pattern")};
+                }
+                lua_pop(lua_state, 1);
             }
             if (spec.name.empty())
             {
                 lua.throw_error("Parameter #1 for function 'RegisterNativeHook' must have a non-empty 'Name'");
             }
 
-            if (!lua.is_function())
-            {
-                lua.throw_error(error_overload_not_found);
-            }
-
-            auto* mod = get_mod_ref(lua);
-            auto hook_lua = get_hook_lua(mod);
+            auto [hook_lua, owner] = get_native_hook_context(lua);
 
             // Move the callback into the hook state: it fires from the game thread, not from the
-            // state that registered it.
-            lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
+            // state that registered it. Last, so that a rejected spec cannot strand a value on the
+            // hook state's stack -- throw_error longjmps out and no unwinding runs.
+            // A no-op when the two are the same state (lua_xmove returns early on from == to), and
+            // make_ref then takes the callback straight off this stack, which is what we want.
+            lua_xmove(lua_state, hook_lua->get_lua_state(), 1);
             const int32_t registry_index = hook_lua->registry().make_ref();
 
             // The dispatcher needs the id, which install() has not returned yet. It cannot fire
@@ -2653,7 +2723,7 @@ Overloads:
             {
                 std::scoped_lock guard{s_native_hook_mutex};
                 s_native_hook_callbacks[hook_id].emplace_back(
-                        NativeHookLuaCallback{.lua = hook_lua, .registry_index = registry_index, .owner = to_string(mod->get_name())});
+                        NativeHookLuaCallback{.lua = hook_lua, .registry_index = registry_index, .owner = owner});
             }
 
             lua.set_integer(hook_id);
@@ -2669,8 +2739,7 @@ Overloads:
                 lua.throw_error("Parameter #1 for function 'UnregisterNativeHook' must be a hook id");
             }
             const auto hook_id = static_cast<int32_t>(lua.get_integer());
-            auto* mod = get_mod_ref(lua);
-            const auto owner = to_string(mod->get_name());
+            const auto owner = get_native_hook_context(lua).second;
 
             bool now_empty{};
             {
@@ -6439,6 +6508,52 @@ Overloads:
         {
             m_async_thread.request_stop();
             m_async_thread.join();
+        }
+
+        // CLOSE THE DOOR, THEN WAIT FOR THE ROOM TO EMPTY -- before taking any lock.
+        //
+        // Setting scheduled_for_removal stops new hook callbacks from entering this mod's Lua
+        // state. It does nothing about one already inside, and fire_on_mod_unload() further down
+        // runs Lua in that same state: two OS threads in one lua_State, which corrupts it and
+        // AVs wherever the VM happens to be (2026-09-04 -- luaV_execute reading p->k, and
+        // funcnamefromcall reading p->code, each on a Proto that was really a string). A hot
+        // hook like ForceLayoutPrepass fires every frame during menu layout, and a callback that
+        // calls FindAllOf sits in the state for tens of milliseconds, so the overlap is likely
+        // rather than exotic.
+        //
+        // Deliberately BEFORE m_thread_actions_mutex is taken: an in-flight callback may itself
+        // need that mutex (ExecuteInGameThread and friends take it), so waiting while holding it
+        // would deadlock exactly the thread being waited on -- which is the hang seen at 09:01.
+        // Bounded, so a genuinely stuck callback delays the reload instead of wedging the game.
+        for (auto& item : g_hooked_script_function_data)
+        {
+            if (item->mod == this)
+            {
+                item->scheduled_for_removal = true;
+            }
+        }
+        // Only THIS mod's counter: another mod's callback runs in another lua_State and cannot
+        // corrupt ours, so waiting on it buys nothing. A single global counter cost 38 seconds per
+        // reload -- one callback that never finished, times nineteen mods, times the full deadline.
+        //
+        // 500ms, not 2s. This waits for a callback to walk out of a Lua state, which takes single-
+        // digit milliseconds even when it calls FindAllOf (~68ms measured in a live heist). Longer
+        // buys no safety, because a callback still inside after half a second is not slow, it is
+        // stuck -- and the point of the bound is that a stuck one delays a reload instead of
+        // wedging the game.
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (m_hook_callbacks_in_flight.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            const auto still_running = m_hook_callbacks_in_flight.load(std::memory_order_acquire);
+            if (still_running > 0)
+            {
+                Output::send(STR("\t{} hook callback(s) still inside '{}'s Lua state after 500ms; unloading anyway\n"),
+                             still_running,
+                             m_mod_name);
+            }
         }
 
         // Now acquire mutex to safely modify shared data structures
