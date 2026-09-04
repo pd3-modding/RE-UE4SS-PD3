@@ -133,6 +133,53 @@ namespace RC::LuaType
             return 1;
         });
 
+        // Replication descriptor access. UClass::SetUpRuntimeReplicationData builds ClassReps
+        // from CPF_Net alone, so setting that flag and clearing CLASS_ReplicationDataIsSetUp on
+        // the owning class is the whole of "make this property replicate". Both are plain
+        // member writes -- see UClass::SetClassFlags for the other half.
+        //
+        // EVERY PEER MUST APPLY THE SAME SET, BEFORE CONNECTING. The rep handle space is
+        // positional over ClassReps: a property present on one side and not the other makes the
+        // receiver read a handle it has no command for, which is a bunch error and drops the
+        // connection (FRepLayout::ReceiveProperties, "Invalid property terminator handle").
+        table.add_pair("GetPropertyFlags", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<XProperty>();
+            lua.set_integer(static_cast<int64_t>(lua_object.get_remote_cpp_object()->GetPropertyFlags()));
+            return 1;
+        });
+
+        table.add_pair("SetPropertyFlags", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<XProperty>();
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'SetPropertyFlags' must be an integer");
+            }
+            const auto flags = static_cast<uint64_t>(lua.get_integer());
+            lua_object.get_remote_cpp_object()->GetPropertyFlags() = static_cast<Unreal::EPropertyFlags>(flags);
+            return 0;
+        });
+
+        // The RepNotify target is looked up by name on the receiving object, so it must be an
+        // existing zero-parameter UFunction on the property's class or a parent. A one-parameter
+        // notify is called with the OLD value, which for a setter-shaped function undoes the
+        // update -- do not point this at K2_SetText and friends.
+        table.add_pair("GetRepNotifyFunc", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<XProperty>();
+            LuaType::FName::construct(lua, lua_object.get_remote_cpp_object()->GetRepNotifyFunc());
+            return 1;
+        });
+
+        table.add_pair("SetRepNotifyFunc", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<XProperty>();
+            if (!lua.is_userdata())
+            {
+                lua.throw_error("Parameter #1 for function 'SetRepNotifyFunc' must be an FName");
+            }
+            auto& name = lua.get_userdata<LuaType::FName>();
+            lua_object.get_remote_cpp_object()->GetRepNotifyFunc() = name.get_local_cpp_object();
+            return 0;
+        });
+
         table.add_pair("IsA", [](const LuaMadeSimple::Lua& lua) -> int {
             std::string error_overload_not_found{R"(
 No overload found for function 'IsA'.

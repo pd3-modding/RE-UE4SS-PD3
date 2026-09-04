@@ -78,6 +78,29 @@ namespace RC::LuaType
             return 1;
         });
 
+        // Class flags, for the other half of enabling replication on a property. Clearing
+        // CLASS_ReplicationDataIsSetUp (0x800) makes the engine rebuild ClassReps from CPF_Net
+        // the next time it needs them -- FRepLayout::InitFromClass and the class net cache both
+        // call SetUpRuntimeReplicationData() themselves, so nothing has to be invoked by hand.
+        //
+        // The rebuild is lazy but the RESULT is cached per class in UNetDriver::RepLayoutMap, so
+        // this has to happen before a net driver exists, i.e. before hosting or joining.
+        table.add_pair("GetClassFlags", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<UClass>();
+            lua.set_integer(static_cast<int64_t>(lua_object.get_remote_cpp_object()->GetClassFlags()));
+            return 1;
+        });
+
+        table.add_pair("SetClassFlags", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto& lua_object = lua.get_userdata<UClass>();
+            if (!lua.is_integer())
+            {
+                lua.throw_error("Parameter #1 for function 'SetClassFlags' must be an integer");
+            }
+            lua_object.get_remote_cpp_object()->GetClassFlags() = static_cast<uint32_t>(lua.get_integer());
+            return 0;
+        });
+
         if constexpr (is_final == LuaMadeSimple::Type::IsFinal::Yes)
         {
             table.add_pair("type", [](const LuaMadeSimple::Lua& lua) -> int {
