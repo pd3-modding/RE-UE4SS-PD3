@@ -31,6 +31,13 @@ namespace RC::ModManagerStore
         std::vector<PendingEdit> s_pending{};
         bool s_drain_armed{false};
 
+        // The per-widget edit state below is touched from two threads: the tab renders on the
+        // GUI thread while re-registration clears it from the Lua/event thread at mod reload.
+        // Its own mutex, always the OUTER lock relative to s_store_mutex (submit() enqueues
+        // under s_store_mutex while holding this one; clear_widget_state() is called WITHOUT
+        // s_store_mutex held, see lua_register_descriptor) -- the reverse order would deadlock.
+        std::mutex s_widget_mutex{};
+
         auto find_mod_locked(const std::string& mod_id) -> ModEntry*
         {
             for (auto& mod : s_mods)
@@ -290,6 +297,9 @@ namespace RC::ModManagerStore
 
         auto clear_widget_state() -> void
         {
+            // WITHOUT s_store_mutex held (see lua_register_descriptor): the lock order this
+            // enforces is s_widget_mutex -> s_store_mutex, never the reverse.
+            std::lock_guard guard{s_widget_mutex};
             widget_scratch().clear();
             widget_held().clear();
             widget_buffers().clear();
@@ -303,6 +313,10 @@ namespace RC::ModManagerStore
 
         auto render_setting(const ModEntry& mod, const SettingSchema& setting, const SettingValue& stored) -> void
         {
+            // The widget state is shared with the event thread (clear at re-registration, the
+            // drain's echo), so the whole read-modify-write of one widget's row runs under
+            // s_widget_mutex. Held per widget, not per frame -- the stores are tiny.
+            std::lock_guard widget_guard{s_widget_mutex};
             auto& edits = ui_edits();
             const std::string key = widget_key(mod.id, setting.id);
 
@@ -650,10 +664,6 @@ namespace RC::ModManagerStore
 
         std::lock_guard guard{s_store_mutex};
 
-        // A re-registered descriptor is a mod reload: the tab's per-widget edit state belongs
-        // to the render it replaced, so drop it. The next frame re-seeds from the fresh values.
-        clear_widget_state();
-
         // Replace-or-create, keeping registration order stable. Value precedence: what the
         // registering state holds now, then what this mirror had, then the schema default.
         bool replaced = false;
@@ -708,6 +718,12 @@ namespace RC::ModManagerStore
                              ensure_str(mod.id), mod.settings.size(), mod.values.size());
             }
         }
+
+        // A re-registered descriptor is a mod reload: the tab's per-widget edit state belongs
+        // to the render it replaced, so drop it. Deliberately OUTSIDE s_store_mutex -- this
+        // takes s_widget_mutex, and the store lock is the INNER one everywhere. The next
+        // render re-seeds from the fresh values above.
+        clear_widget_state();
 
         return 0;
     }
