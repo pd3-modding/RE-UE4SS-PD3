@@ -143,10 +143,13 @@ namespace RC::MCP
             push_activity(ActivityRecord::Kind::ToolCall, std::move(text), ok);
         }
 
-        extern "C" bool lua_eval_cb(void*, const McpChar* code, McpString* out)
+        // Shared by every tool that must run on the game thread: parks the request and
+        // blocks until the engine tick hook drains it, or the timeout expires because a
+        // game thread stuck in a map load must not hang the HTTP request forever.
+        auto queue_and_wait(std::string code, McpString* out) -> bool
         {
             auto request = std::make_shared<PendingEval>();
-            request->code = code ? to_string(File::StringType{code}) : std::string{};
+            request->code = std::move(code);
 
             // Clamp: a zero or negative ini value would otherwise mean "give up instantly".
             const auto timeout = std::chrono::milliseconds{std::max<int64_t>(1000, UE4SSProgram::settings_manager.MCP.GameThreadTimeoutMs)};
@@ -187,6 +190,50 @@ namespace RC::MCP
 
             make_string(output, out);
             return ok;
+        }
+
+        extern "C" bool lua_eval_cb(void*, const McpChar* code, McpString* out)
+        {
+            return queue_and_wait(code ? to_string(File::StringType{code}) : std::string{}, out);
+        }
+
+        // A command string embedded into a single-quoted Lua literal: escape what would
+        // otherwise close the literal or smuggle a newline into it.
+        auto lua_escape(const std::string& raw) -> std::string
+        {
+            std::string escaped;
+            escaped.reserve(raw.size() + 2);
+            for (char c : raw)
+            {
+                switch (c)
+                {
+                case '\\': escaped.append("\\\\"); break;
+                case '\'': escaped.append("\\'"); break;
+                case '\n': escaped.append("\\n"); break;
+                case '\r': break; // a CR in a command line is noise; drop it
+                default: escaped.push_back(c); break;
+                }
+            }
+            return escaped;
+        }
+
+        // The engine's own console executor (KismetSystemLibrary::ExecuteConsoleCommand), so
+        // the command runs exactly as if typed in the in-game console: CVars, engine
+        // commands, and any mod handler registered via RegisterConsoleCommandHandler all
+        // fire. Proven live 2026-09-05 (stat fps). Marshals to the game thread through the
+        // same queue as lua_eval -- the snippet is the smallest proven route to the executor,
+        // and the MCP eval state already carries the globals it needs.
+        extern "C" bool execute_console_command_cb(void*, const McpChar* command, McpString* out)
+        {
+            const std::string cmd = command ? to_string(File::StringType{command}) : std::string{};
+            const std::string code = fmt::format(
+                R"lua(local ksl = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+if ksl == nil or not ksl:IsValid() then print("no KismetSystemLibrary statics") return end
+local pc = FindFirstOf("PlayerController")
+local ok, err = pcall(function() ksl:ExecuteConsoleCommand(pc, '{}', nil) end)
+print("exec ok=" .. tostring(ok) .. (err ~= nil and (" err=" .. tostring(err)) or "")))lua",
+                lua_escape(cmd));
+            return queue_and_wait(code, out);
         }
 
         // Deliberately does NOT go through the game thread: this is the tool you reach for
@@ -327,6 +374,7 @@ namespace RC::MCP
             host.game_status = &game_status_cb;
             host.log_tail = &log_tail_cb;
             host.reload_mods = &reload_mods_cb;
+            host.execute_console_command = &execute_console_command_cb;
             host.on_tool_call = &on_tool_call_cb;
             host.free_string = &free_string_cb;
             return host;
