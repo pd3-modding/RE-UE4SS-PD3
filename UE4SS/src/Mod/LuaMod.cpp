@@ -7145,6 +7145,14 @@ Overloads:
         Unreal::Hook::RegisterLoadMapPreCallback(
                 [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData, Unreal::UEngine* Engine, Unreal::FWorldContext& WorldContext, Unreal::FURL URL, Unreal::UPendingNetGame* PendingGame, Unreal::FString& Error) {
                     TRY([&] {
+                        // LOCK: uninstall() erases these callbacks and lua_close()s the owning
+                        // mod's Lua state under this same mutex, so a callback that is mid-Lua
+                        // makes uninstall() wait for it, and one that blocks on the mutex
+                        // instead finds its callbacks already erased -- neither can run Lua in
+                        // a closed state. The 2026-09-05 reload crash (lua_rawgeti on a freed
+                        // Lua stack, game worker thread) was exactly that: these fire sites
+                        // took no lock at all, unlike script_hook and the notify paths.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_load_map_pre_callbacks)
                         {
                             for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7180,6 +7188,8 @@ Overloads:
         Unreal::Hook::RegisterLoadMapPostCallback(
                 [](Unreal::Hook::TCallbackIterationData<bool>& CallbackIterationData, Unreal::UEngine* Engine, Unreal::FWorldContext& WorldContext, Unreal::FURL URL, Unreal::UPendingNetGame* PendingGame, Unreal::FString& Error) {
                     TRY([&] {
+                        // Same lock as the LoadMap pre-callback: uninstall() erases + closes under it.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_load_map_post_callbacks)
                         {
                             for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7214,6 +7224,8 @@ Overloads:
 
         Unreal::Hook::RegisterInitGameStatePreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_init_game_state_pre_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7231,6 +7243,8 @@ Overloads:
 
         Unreal::Hook::RegisterInitGameStatePostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AGameModeBase* Context) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_init_game_state_post_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7248,6 +7262,10 @@ Overloads:
 
         Unreal::Hook::RegisterBeginPlayPreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                // BeginPlay/EndPlay fire constantly in a live heist (spawns, deaths), which is
+                // what made these the likely crasher.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_begin_play_pre_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7265,6 +7283,8 @@ Overloads:
 
         Unreal::Hook::RegisterBeginPlayPostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_begin_play_post_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7282,6 +7302,8 @@ Overloads:
 
         Unreal::Hook::RegisterEndPlayPreCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context, Unreal::EEndPlayReason EndPlayReason) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_end_play_pre_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7301,6 +7323,8 @@ Overloads:
 
         Unreal::Hook::RegisterEndPlayPostCallback([]([[maybe_unused]] Unreal::Hook::TCallbackIterationData<void>& CallbackIterationData, [[maybe_unused]] Unreal::AActor* Context, Unreal::EEndPlayReason EndPlayReason) {
             TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_end_play_post_callbacks)
                 {
                     for (const auto& [lua_ptr, registry_index] : callback_data.registry_indexes)
@@ -7423,6 +7447,8 @@ Overloads:
         Unreal::Hook::RegisterULocalPlayerExecPreCallback([](Unreal::ULocalPlayer* context, Unreal::UWorld* in_world, const TCHAR* cmd, Unreal::FOutputDevice& ar)
                                                                   -> Unreal::Hook::ULocalPlayerExecCallbackReturnValue {
             return TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_local_player_exec_pre_callbacks)
                 {
                     Unreal::Hook::ULocalPlayerExecCallbackReturnValue return_value{};
@@ -7479,6 +7505,8 @@ Overloads:
         Unreal::Hook::RegisterULocalPlayerExecPostCallback([](Unreal::ULocalPlayer* context, Unreal::UWorld* in_world, const TCHAR* cmd, Unreal::FOutputDevice& ar)
                                                                    -> Unreal::Hook::ULocalPlayerExecCallbackReturnValue {
             return TRY([&] {
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 for (const auto& callback_data : m_local_player_exec_post_callbacks)
                 {
                     Unreal::Hook::ULocalPlayerExecCallbackReturnValue return_value{};
@@ -7537,6 +7565,8 @@ Overloads:
                         -> std::pair<bool, bool> {
                     return TRY([&] {
                         std::pair<bool, bool> return_value{};
+                        // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_call_function_by_name_with_arguments_pre_callbacks)
                         {
 
@@ -7579,6 +7609,8 @@ Overloads:
                         -> std::pair<bool, bool> {
                     return TRY([&] {
                         std::pair<bool, bool> return_value{};
+                        // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_call_function_by_name_with_arguments_post_callbacks)
                         {
 
@@ -7714,6 +7746,8 @@ Overloads:
                         auto command_parts = explode_by_occurrence_with_quotes(command, STR(' '));
 
                         std::pair<bool, bool> return_value{};
+                        // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_process_console_exec_pre_callbacks)
                         {
 
@@ -7764,6 +7798,8 @@ Overloads:
                         auto command_parts = explode_by_occurrence_with_quotes(command, STR(' '));
 
                         std::pair<bool, bool> return_value{};
+                        // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                        std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                         for (const auto& callback_data : m_process_console_exec_post_callbacks)
                         {
                             for (const auto& [lua, registry_index] : callback_data.registry_indexes)
@@ -7823,6 +7859,8 @@ Overloads:
                     command_name = command_parts[0];
                 }
 
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 if (auto it = m_custom_command_lua_pre_callbacks.find(command_name); it != m_custom_command_lua_pre_callbacks.end())
                 {
                     const auto& callback_data = it->second;
@@ -7874,6 +7912,8 @@ Overloads:
                     command_name = command_parts[0];
                 }
 
+                // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
+                std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
                 if (auto it = m_global_command_lua_callbacks.find(command_name); it != m_global_command_lua_callbacks.end())
                 {
                     const auto& callback_data = it->second;
