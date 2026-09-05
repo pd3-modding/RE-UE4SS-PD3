@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -7140,6 +7141,59 @@ Overloads:
         });
     }
 
+    // Namespace metadata the Lua side exports (PD3Core/commands.lua, the PD3CommandMeta
+    // state-global): the fork-side command maps store names only, so the mod name, the
+    // namespace's description and per-command descriptions are read from the Lua state that
+    // registered the commands. Safe on the game thread under m_thread_actions_mutex: that
+    // state's scripts also only run on the game thread, so no concurrent GC can race the reads.
+    struct CommandMeta
+    {
+        File::StringType name{};
+        File::StringType desc{};
+        std::map<File::StringType, File::StringType> commands{};
+    };
+
+    static auto read_command_meta(const LuaMadeSimple::Lua& lua, const File::StringType& ns) -> std::optional<CommandMeta>
+    {
+        lua_State* L = lua.get_lua_state();
+        if (lua_getglobal(L, "PD3CommandMeta") != LUA_TTABLE)
+        {
+            lua_pop(L, 1);
+            return std::nullopt;
+        }
+        if (lua_getfield(L, -1, to_string(ns).c_str()) != LUA_TTABLE)
+        {
+            lua_pop(L, 2);
+            return std::nullopt;
+        }
+        CommandMeta meta{};
+        if (lua_getfield(L, -1, "name") == LUA_TSTRING)
+        {
+            meta.name = ensure_str(lua_tostring(L, -1));
+        }
+        lua_pop(L, 1);
+        if (lua_getfield(L, -1, "desc") == LUA_TSTRING)
+        {
+            meta.desc = ensure_str(lua_tostring(L, -1));
+        }
+        lua_pop(L, 1);
+        if (lua_getfield(L, -1, "commands") == LUA_TTABLE)
+        {
+            lua_pushnil(L);
+            while (lua_next(L, -2) != 0)
+            {
+                if (lua_isstring(L, -2) && lua_isstring(L, -1))
+                {
+                    meta.commands[ensure_str(lua_tostring(L, -2))] = ensure_str(lua_tostring(L, -1));
+                }
+                lua_pop(L, 1); // the value; the key stays for lua_next
+            }
+            lua_pop(L, 1); // the commands table
+        }
+        lua_pop(L, 2); // the ns table and PD3CommandMeta
+        return meta;
+    }
+
     auto LuaMod::on_program_start() -> void
     {
         Unreal::UObjectArray::AddUObjectDeleteListener(&LuaType::FLuaObjectDeleteListener::s_lua_object_delete_listener);
@@ -7882,9 +7936,25 @@ Overloads:
                         filter = command_parts[1];
                     }
 
+                    auto find_meta = [&](const File::StringType& ns) -> std::optional<CommandMeta> {
+                        File::StringType prefix{ns + STR(".")};
+                        for (const auto* map : {&LuaMod::m_custom_command_lua_pre_callbacks, &LuaMod::m_global_command_lua_callbacks})
+                        {
+                            for (const auto& [name, data] : *map)
+                            {
+                                if (name.starts_with(prefix))
+                                {
+                                    return read_command_meta(*data.lua, ns);
+                                }
+                            }
+                        }
+                        return std::nullopt;
+                    };
+
                     if (!filter.empty())
                     {
-                        // "list wv" -- the commands under one namespace, one per line.
+                        // "list wv" -- one namespace: its header line, then one command per
+                        // line with its description when the Lua side exported one.
                         File::StringType prefix{filter + STR(".")};
                         std::vector<File::StringType> found{};
                         for (const auto& name : names)
@@ -7894,19 +7964,40 @@ Overloads:
                         if (found.empty())
                         {
                             ar.Logf(STR("no console commands registered under '%s'"), filter.c_str());
+                            return true;
+                        }
+
+                        auto meta = find_meta(filter);
+                        if (meta)
+                        {
+                            File::StringType header{filter};
+                            if (!meta->name.empty()) header += STR(" (") + meta->name + STR(")");
+                            if (!meta->desc.empty()) header += STR(" -- ") + meta->desc;
+                            ar.Log(header.c_str());
                         }
                         for (const auto& name : found)
                         {
-                            ar.Log(name.c_str());
+                            const File::StringType suffix = name.substr(prefix.size());
+                            const bool has_desc = meta && meta->commands.contains(suffix) && !meta->commands.at(suffix).empty();
+                            if (has_desc)
+                            {
+                                ar.Logf(STR("%s -- %s"), name.c_str(), meta->commands.at(suffix).c_str());
+                            }
+                            else
+                            {
+                                ar.Log(name.c_str());
+                            }
                         }
-                        if (names.contains(filter + STR(".help")))
+                        if (!meta && names.contains(filter + STR(".help")))
                         {
                             ar.Logf(STR("run '%s.help' for descriptions"), filter.c_str());
                         }
                         return true;
                     }
 
-                    // bare "list" -- group every registered command by its namespace prefix.
+                    // bare "list" -- group every registered command by its namespace; the
+                    // group's header line carries the mod name and description when the Lua
+                    // side exported them.
                     if (names.empty())
                     {
                         ar.Log(STR("no console commands registered"));
@@ -7922,7 +8013,28 @@ Overloads:
                     for (auto& [prefix, cmds] : groups)
                     {
                         std::sort(cmds.begin(), cmds.end());
-                        File::StringType line{prefix + STR(": ")};
+                        if (prefix == STR("(unprefixed)"))
+                        {
+                            File::StringType line{prefix + STR(": ")};
+                            for (size_t i = 0; i < cmds.size(); ++i)
+                            {
+                                if (i) line += STR(", ");
+                                line += cmds[i];
+                            }
+                            ar.Log(line.c_str());
+                            continue;
+                        }
+
+                        auto meta = find_meta(prefix);
+                        const bool has_header = meta && (!meta->name.empty() || !meta->desc.empty());
+                        if (has_header)
+                        {
+                            File::StringType header{prefix};
+                            if (!meta->name.empty()) header += STR(" (") + meta->name + STR(")");
+                            if (!meta->desc.empty()) header += STR(" -- ") + meta->desc;
+                            ar.Log(header.c_str());
+                        }
+                        File::StringType line{has_header ? STR("  ") : prefix + STR(": ")};
                         for (size_t i = 0; i < cmds.size(); ++i)
                         {
                             if (i) line += STR(", ");
