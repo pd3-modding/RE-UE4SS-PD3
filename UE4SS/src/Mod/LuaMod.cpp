@@ -23,6 +23,7 @@
 #include <Input/Handler.hpp>
 #include <LuaLibrary.hpp>
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
+#include <ModManagerStore/ModManagerStore.hpp>
 #include <LuaType/LuaAActor.hpp>
 #include <LuaType/LuaCustomProperty.hpp>
 #include <LuaType/LuaFName.hpp>
@@ -2654,6 +2655,19 @@ Overloads:
                     .registry_indexes = {std::pair<const LuaMadeSimple::Lua*, LuaMod::LuaCallbackData::RegistryIndex>{hook_lua, lua_callback_registry_index}}});
 
             return 0;
+        });
+
+        // Mirror a settings descriptor into the native store that backs the debug GUI's
+        // "Mod Manager" tab (ModManagerStore/ModManagerStore.cpp). The Lua side of the bridge
+        // is shared/PD3ModManager: MM.register calls the first, its change notification calls
+        // the second. Both are plain-data -- functions in the descriptor are skipped at the
+        // boundary -- and both are optional: on the stock loader these globals do not exist,
+        // and the bridge checks before calling.
+        lua.register_function("RegisterNativeDescriptor", [](const LuaMadeSimple::Lua& lua) -> int {
+            return ModManagerStore::lua_register_descriptor(lua);
+        });
+        lua.register_function("PushNativeValue", [](const LuaMadeSimple::Lua& lua) -> int {
+            return ModManagerStore::lua_push_value(lua);
         });
 
         // Detour an arbitrary native function by address and call back into Lua.

@@ -38,6 +38,7 @@
 #include <Signatures.hpp>
 #include <Timer/ScopedTimer.hpp>
 #include <MCP/MCPServer.hpp>
+#include <ModManagerStore/ModManagerStore.hpp>
 #include <NativeHook.hpp>
 #include <UE4SSProgram.hpp>
 #include <Unreal/AGameMode.hpp>
@@ -504,6 +505,11 @@ namespace RC
             // that services its requests) and the Lua machinery available. A no-op unless
             // built with UE4SS_ENABLE_MCP and enabled in UE4SS-settings.ini.
             MCP::MCPServer::start();
+
+            // Needs the GUI (for its tab) and the Lua machinery (its functions are registered
+            // on every state by share_lua_functions, which has run by now). Unconditional --
+            // the Mod Manager tab is a core feature, not MCP-gated.
+            ModManagerStore::start();
 
             // Only deal with the event loop thread here if the 'Test' constructor doesn't need to be called
 #ifndef RUN_TESTS
