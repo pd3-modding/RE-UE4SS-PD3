@@ -8,7 +8,9 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <mutex>
@@ -7861,6 +7863,76 @@ Overloads:
 
                 // Same lock as the LoadMap callbacks: uninstall() erases + closes under it.
                 std::lock_guard<std::recursive_mutex> thread_actions_guard{LuaMod::m_thread_actions_mutex};
+
+                // Fork-level "list" / "list <prefix>": enumerate every console command registered
+                // through the Lua API (RegisterConsoleCommandHandler / RegisterConsoleCommandGlobalHandler).
+                // The Lua-level registries are per-mod -- each Lua mod runs its own lua_State with its
+                // own copy of the shared modules -- so no Lua mod can enumerate another's commands.
+                // These maps are the only cross-mod registry that exists, so the listing lives here.
+                // Names only: descriptions live in each mod's Lua state and are not stored in the maps.
+                if (command_name == STR("list"))
+                {
+                    std::set<File::StringType> names{};
+                    for (const auto& [name, data] : LuaMod::m_custom_command_lua_pre_callbacks) names.insert(name);
+                    for (const auto& [name, data] : LuaMod::m_global_command_lua_callbacks) names.insert(name);
+
+                    File::StringType filter{};
+                    if (command_parts.size() > 1)
+                    {
+                        filter = command_parts[1];
+                    }
+
+                    if (!filter.empty())
+                    {
+                        // "list wv" -- the commands under one namespace, one per line.
+                        File::StringType prefix{filter + STR(".")};
+                        std::vector<File::StringType> found{};
+                        for (const auto& name : names)
+                        {
+                            if (name.starts_with(prefix)) found.push_back(name);
+                        }
+                        if (found.empty())
+                        {
+                            ar.Logf(STR("no console commands registered under '%s'"), filter.c_str());
+                        }
+                        for (const auto& name : found)
+                        {
+                            ar.Log(name.c_str());
+                        }
+                        if (names.contains(filter + STR(".help")))
+                        {
+                            ar.Logf(STR("run '%s.help' for descriptions"), filter.c_str());
+                        }
+                        return true;
+                    }
+
+                    // bare "list" -- group every registered command by its namespace prefix.
+                    if (names.empty())
+                    {
+                        ar.Log(STR("no console commands registered"));
+                        return true;
+                    }
+                    std::map<File::StringType, std::vector<File::StringType>> groups{};
+                    for (const auto& name : names)
+                    {
+                        auto dot = name.find(STR('.'));
+                        File::StringType prefix = dot == StringType::npos ? STR("(unprefixed)") : name.substr(0, dot);
+                        groups[prefix].push_back(dot == StringType::npos ? name : name.substr(dot + 1));
+                    }
+                    for (auto& [prefix, cmds] : groups)
+                    {
+                        std::sort(cmds.begin(), cmds.end());
+                        File::StringType line{prefix + STR(": ")};
+                        for (size_t i = 0; i < cmds.size(); ++i)
+                        {
+                            if (i) line += STR(", ");
+                            line += cmds[i];
+                        }
+                        ar.Log(line.c_str());
+                    }
+                    return true;
+                }
+
                 if (auto it = m_custom_command_lua_pre_callbacks.find(command_name); it != m_custom_command_lua_pre_callbacks.end())
                 {
                     const auto& callback_data = it->second;
