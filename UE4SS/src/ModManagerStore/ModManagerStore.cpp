@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <GUI/GUITab.hpp>
@@ -254,6 +255,47 @@ namespace RC::ModManagerStore
             return s_ui_edits;
         }
 
+        // ------------------------------------------------------------------------------
+        // Per-widget edit state. A control is seeded from the store ONLY when it was not
+        // active last frame; while it is held, the widget owns its value. Re-seeding while
+        // active is what broke both editable kinds here: for InputText it is an external
+        // buffer modification mid-edit (the user's typed text was clobbered by the next
+        // frame's seed -- the "text fields never update" report), and for a slider it snaps
+        // the handle back to the stored value under the drag. Committing once on
+        // deactivation is also the contract the UMG screen follows (defer + flush at
+        // capture end): one MM.set_value per gesture instead of one per drag tick, so a
+        // mod's on_value_change does not run every tick of a drag.
+        // ------------------------------------------------------------------------------
+        auto widget_scratch() -> std::unordered_map<std::string, SettingValue>&
+        {
+            static std::unordered_map<std::string, SettingValue> s{};
+            return s;
+        }
+
+        auto widget_held() -> std::unordered_set<std::string>&
+        {
+            static std::unordered_set<std::string> s{};
+            return s;
+        }
+
+        // InputText edits its buffer in place across frames, so each str/text widget needs a
+        // persistent buffer of its own. The single static buffer this replaced was seeded by
+        // every text row in turn, so one row's in-flight edit was overwritten by the next
+        // row's seed before its own widget call ran again.
+        auto widget_buffers() -> std::unordered_map<std::string, std::vector<char>>&
+        {
+            static std::unordered_map<std::string, std::vector<char>> s{};
+            return s;
+        }
+
+        auto clear_widget_state() -> void
+        {
+            widget_scratch().clear();
+            widget_held().clear();
+            widget_buffers().clear();
+            ui_edits().clear();
+        }
+
         auto widget_key(const std::string& mod_id, const std::string& setting_id) -> std::string
         {
             return mod_id + '\x01' + setting_id;
@@ -298,10 +340,35 @@ namespace RC::ModManagerStore
             {
                 if (setting.has_min && setting.has_max)
                 {
-                    float v = static_cast<float>(display->number);
-                    if (ImGui::SliderFloat("##v", &v, static_cast<float>(setting.min), static_cast<float>(setting.max)))
+                    // The drag's in-flight value, tracked per widget: the slider is seeded from
+                    // the store only when it is not held, and submitted ONCE, on release. A drag
+                    // that ends where it started submits nothing.
+                    const bool held = widget_held().count(key) != 0;
+                    auto& scratch = widget_scratch();
+                    auto held_it = scratch.find(key);
+                    float v = (held && held_it != scratch.end()
+                               && held_it->second.kind == SettingValue::Kind::Number)
+                                  ? static_cast<float>(held_it->second.number)
+                                  : static_cast<float>(display->number);
+                    if (ImGui::SliderFloat("##v", &v, static_cast<float>(setting.min),
+                                           static_cast<float>(setting.max)))
                     {
-                        submit(SettingValue{.kind = SettingValue::Kind::Number, .number = v});
+                        widget_scratch()[key] =
+                            SettingValue{.kind = SettingValue::Kind::Number, .number = v};
+                    }
+                    if (ImGui::IsItemActive())
+                    {
+                        widget_held().insert(key);
+                    }
+                    else
+                    {
+                        widget_held().erase(key);
+                        auto committed = scratch.find(key);
+                        if (ImGui::IsItemDeactivatedAfterEdit() && committed != scratch.end())
+                        {
+                            submit(committed->second);
+                            scratch.erase(committed);
+                        }
                     }
                 }
                 else
@@ -340,26 +407,49 @@ namespace RC::ModManagerStore
             }
             default: // str / text
             {
-                static char buffer[1024];
-                const bool multiline = setting.type == "text";
-                const size_t copy_len = std::min(display->string.size(), sizeof(buffer) - 1);
-                memcpy(buffer, display->string.data(), copy_len);
-                buffer[copy_len] = '\0';
+                // A per-widget buffer, seeded from the store only when this widget is not held.
+                // While it is held, the buffer IS the edit in progress; overwriting it per frame
+                // from the store reverts every keystroke on the frame after it lands. Committed
+                // on deactivation, and dropped with the commit so the next inactive frame
+                // re-seeds from whatever the echo landed.
+                static constexpr size_t TEXT_BUF = 4096;
+                const bool held = widget_held().count(key) != 0;
+                auto buf_it = widget_buffers().find(key);
+                if (buf_it == widget_buffers().end())
+                {
+                    buf_it = widget_buffers().emplace(key, std::vector<char>(TEXT_BUF, '\0')).first;
+                }
+                auto& buf = buf_it->second;
+                if (!held)
+                {
+                    const size_t copy_len = std::min(display->string.size(), buf.size() - 1);
+                    if (copy_len > 0) memcpy(buf.data(), display->string.data(), copy_len);
+                    buf[copy_len] = '\0';
+                }
 
-                // Re-seeding the buffer each frame is safe while the widget is active: ImGui
-                // edits its own internal copy and only writes back here. Committed on
-                // deactivate -- per-keystroke submits would queue a chunk per key.
+                const bool multiline = setting.type == "text";
                 if (multiline)
                 {
-                    ImGui::InputTextMultiline("##v", buffer, sizeof(buffer), ImVec2(0, 80));
+                    ImGui::InputTextMultiline("##v", buf.data(), buf.size(), ImVec2(0, 80));
                 }
                 else
                 {
-                    ImGui::InputText("##v", buffer, sizeof(buffer), ImGuiInputTextFlags_EnterReturnsTrue);
+                    ImGui::InputText("##v", buf.data(), buf.size(), ImGuiInputTextFlags_EnterReturnsTrue);
                 }
-                if (ImGui::IsItemDeactivatedAfterEdit())
+
+                if (ImGui::IsItemActive())
                 {
-                    submit(SettingValue{.kind = SettingValue::Kind::String, .string = std::string{buffer}});
+                    widget_held().insert(key);
+                }
+                else
+                {
+                    widget_held().erase(key);
+                    if (ImGui::IsItemDeactivatedAfterEdit())
+                    {
+                        submit(SettingValue{.kind = SettingValue::Kind::String,
+                                            .string = std::string{buf.data()}});
+                        widget_buffers().erase(key);
+                    }
                 }
                 break;
             }
@@ -559,6 +649,10 @@ namespace RC::ModManagerStore
         }
 
         std::lock_guard guard{s_store_mutex};
+
+        // A re-registered descriptor is a mod reload: the tab's per-widget edit state belongs
+        // to the render it replaced, so drop it. The next frame re-seeds from the fresh values.
+        clear_widget_state();
 
         // Replace-or-create, keeping registration order stable. Value precedence: what the
         // registering state holds now, then what this mirror had, then the schema default.
