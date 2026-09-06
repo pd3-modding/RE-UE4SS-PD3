@@ -560,6 +560,10 @@ namespace RC::LuaType
 
             table.add_pair("GetOuter", [](const LuaMadeSimple::Lua& lua) -> int {
                 const auto& lua_object = lua.get_userdata<SelfType>();
+                if (!lua_object.get_remote_cpp_object())
+                {
+                    lua.throw_error("GetOuter called on a null UObject wrapper");
+                }
 
                 UObject::construct(lua, lua_object.get_remote_cpp_object()->GetOuterPrivate());
 
@@ -568,6 +572,10 @@ namespace RC::LuaType
 
             table.add_pair("IsAnyClass", [](const LuaMadeSimple::Lua& lua) -> int {
                 const auto& lua_object = lua.get_userdata<SelfType>();
+                if (!lua_object.get_remote_cpp_object())
+                {
+                    lua.throw_error("IsAnyClass called on a null UObject wrapper");
+                }
 
                 lua.set_bool(lua_object.get_remote_cpp_object()->template IsA<Unreal::UClass>());
 
@@ -640,12 +648,20 @@ namespace RC::LuaType
                 //       We could use strings or FNames, those could be calculated on the Lua side and then
                 //       we wouldn't need to preemptively expose anything
                 const auto& lua_object = lua.get_userdata<SelfType>();
+                if (!lua_object.get_remote_cpp_object())
+                {
+                    lua.throw_error("IsClass called on a null UObject wrapper");
+                }
                 lua.set_bool(lua_object.get_remote_cpp_object()->template IsA<Unreal::UClass>());
                 return 1;
             });
 
             table.add_pair("GetWorld", [](const LuaMadeSimple::Lua& lua) -> int {
                 const auto& lua_object = lua.get_userdata<SelfType>();
+                if (!lua_object.get_remote_cpp_object())
+                {
+                    lua.throw_error("GetWorld called on a null UObject wrapper");
+                }
                 auto_construct_object(lua, lua_object.get_remote_cpp_object()->GetWorld());
                 return 1;
             });

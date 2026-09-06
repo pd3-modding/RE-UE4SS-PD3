@@ -375,12 +375,23 @@ namespace RC::LuaType
     auto construct_fname(const LuaMadeSimple::Lua& lua) -> void
     {
         const auto& lua_object = lua.get_userdata<UObject>();
+        if (!lua_object.get_remote_cpp_object())
+        {
+            // Null-check before the native deref: this used to be a game-crashing AV (+0x20
+            // on the object pointer) whenever FindAllOf/hook params handed back a dead
+            // wrapper. throw_error is catchable by Lua pcall. PAYDAY 3 modding, 2026-09-06.
+            lua.throw_error("GetFName called on a null UObject wrapper");
+        }
         LuaType::FName::construct(lua, lua_object.get_remote_cpp_object()->GetNamePrivate());
     }
 
     auto construct_uclass(const LuaMadeSimple::Lua& lua) -> void
     {
         const auto& lua_object = lua.get_userdata<UObject>();
+        if (!lua_object.get_remote_cpp_object())
+        {
+            lua.throw_error("GetClass called on a null UObject wrapper");
+        }
         LuaType::UClass::construct(lua, lua_object.get_remote_cpp_object()->GetClassPrivate());
     }
 
