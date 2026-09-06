@@ -4283,6 +4283,17 @@ Overloads:
         std::vector<LuaMod::SimpleLuaAction> deferred{};
         for (auto& lua_data : to_run)
         {
+            // THE UNLOAD SKIP. This list was swapped out from under m_thread_actions_mutex and
+            // runs lock-free, so a reload that uninstalls mods mid-list can never see these
+            // from its erase -- and lua_close fires while they sit here. An action whose mod
+            // has begun unloading is DEAD: running it, or even luaL_unref on it, touches the
+            // closed state (2026-09-06 11:00, luaH_getint on a null registry). Skip both; the
+            // ref dies with the state.
+            if (lua_data.mod && lua_data.mod->m_unload_started.load(std::memory_order_acquire))
+            {
+                continue;
+            }
+
             if (LuaMod::m_is_currently_executing_game_action)
             {
                 deferred.emplace_back(std::move(lua_data));
@@ -4430,6 +4441,7 @@ Overloads:
             size_t index{};
             const LuaMadeSimple::Lua* lua{};
             int32_t lua_action_function_ref{};
+            LuaMod* mod{};
         };
 
         std::vector<ReadyDelayedExec> ready{};
@@ -4487,13 +4499,21 @@ Overloads:
                 }
 
                 action.status = LuaMod::DelayedActionStatus::Executing;
-                ready.push_back(ReadyDelayedExec{i, action.lua, action.lua_action_function_ref});
+                ready.push_back(ReadyDelayedExec{i, action.lua, action.lua_action_function_ref, action.mod});
             }
         }
 
         for (auto& exec : ready)
         {
             if (LuaMod::m_is_currently_executing_game_action)
+            {
+                continue;
+            }
+
+            // See process_simple_actions: an action of a mod that began unloading is dead --
+            // its Lua state may already be closed. Skip the call AND the ref release; the
+            // registry entry dies with the state.
+            if (exec.mod && exec.mod->m_unload_started.load(std::memory_order_acquire))
             {
                 continue;
             }
@@ -4574,7 +4594,7 @@ Overloads:
     {
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-            LuaMod::m_is_processing_actions = true;
+            LuaMod::m_is_processing_actions.fetch_add(1, std::memory_order_acq_rel);
         }
 
         process_simple_actions(LuaMod::m_game_thread_actions);
@@ -4582,9 +4602,16 @@ Overloads:
 
         process_pending_notify_on_new_object_callbacks();
 
+        // CLEAR THE FLAG OUTSIDE THE MUTEX. uninstall() waits on it while HOLDING the mutex
+        // (its entry blocked every new drain from starting; the in-flight one is the only
+        // thing still inside Lua), so the teardown must not need the lock to signal: clear
+        // first, notify, and only then re-acquire for the pending re-insert -- which runs no
+        // Lua and therefore cannot race lua_close.
+        LuaMod::m_is_processing_actions.fetch_sub(1, std::memory_order_acq_rel);
+        LuaMod::m_is_processing_actions.notify_all();
+
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-            LuaMod::m_is_processing_actions = false;
             if (!LuaMod::m_pending_game_thread_actions.empty())
             {
                 LuaMod::m_game_thread_actions.insert(
@@ -4611,7 +4638,7 @@ Overloads:
     {
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-            LuaMod::m_is_processing_actions = true;
+            LuaMod::m_is_processing_actions.fetch_add(1, std::memory_order_acq_rel);
         }
 
         process_simple_actions(LuaMod::m_engine_tick_actions);
@@ -4619,9 +4646,12 @@ Overloads:
 
         process_pending_notify_on_new_object_callbacks();
 
+        // CLEAR THE FLAG OUTSIDE THE MUTEX (see process_event_hook for why).
+        LuaMod::m_is_processing_actions.fetch_sub(1, std::memory_order_acq_rel);
+        LuaMod::m_is_processing_actions.notify_all();
+
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
-            LuaMod::m_is_processing_actions = false;
             if (!LuaMod::m_pending_engine_tick_actions.empty())
             {
                 LuaMod::m_engine_tick_actions.insert(
@@ -4871,10 +4901,11 @@ Overloads:
             const auto func_ref = luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX);
 
             SimpleLuaAction simpleAction{hook_lua, func_ref, lua_thread_registry_index};
+            simpleAction.mod = mod;
             if (method == GameThreadExecutionMethod::EngineTick)
             {
                 // Use pending queue if we're currently iterating to prevent iterator invalidation
-                if (LuaMod::m_is_processing_actions)
+                if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
                 {
                     LuaMod::m_pending_engine_tick_actions.emplace_back(simpleAction);
                 }
@@ -4886,7 +4917,7 @@ Overloads:
             else
             {
                 // Use pending queue if we're currently iterating to prevent iterator invalidation
-                if (LuaMod::m_is_processing_actions)
+                if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
                 {
                     LuaMod::m_pending_game_thread_actions.emplace_back(simpleAction);
                 }
@@ -4990,13 +5021,14 @@ Overloads:
                 action.lua = hook_lua;
                 action.lua_action_function_ref = func_ref;
                 action.lua_action_thread_ref = lua_thread_registry_index;
+                action.mod = mod;
                 action.method = method;
                 action.delay_ms = delay_ms;
                 action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
                 action.handle = handle;
 
                 // Use pending queue if we're currently iterating to prevent iterator invalidation
-                if (LuaMod::m_is_processing_actions)
+                if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
                 {
                     LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
                 }
@@ -5025,13 +5057,14 @@ Overloads:
                 action.lua = hook_lua;
                 action.lua_action_function_ref = func_ref;
                 action.lua_action_thread_ref = lua_thread_registry_index;
+                action.mod = mod;
                 action.method = method;
                 action.delay_ms = delay_ms;
                 action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
                 action.handle = LuaMod::m_next_delayed_action_handle++;
 
                 // Use pending queue if we're currently iterating to prevent iterator invalidation
-                if (LuaMod::m_is_processing_actions)
+                if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
                 {
                     LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
                 }
@@ -5133,6 +5166,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
+            action.mod = mod;
             action.method = method;
             action.delay_ms = delay_ms;
             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5140,7 +5174,7 @@ Overloads:
             action.handle = handle;
 
             // Use pending queue if we're currently iterating to prevent iterator invalidation
-            if (LuaMod::m_is_processing_actions)
+            if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
             {
                 LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
             }
@@ -5188,12 +5222,13 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
+            action.mod = mod;
             action.delay_frames = frames;
             action.frames_remaining = frames;
             action.handle = LuaMod::m_next_delayed_action_handle++;
 
             // Use pending queue if we're currently iterating to prevent iterator invalidation
-            if (LuaMod::m_is_processing_actions)
+            if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
             {
                 LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
             }
@@ -5267,6 +5302,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
+            action.mod = mod;
             action.method = method;
             action.delay_ms = delay_ms;
             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5274,7 +5310,7 @@ Overloads:
             action.handle = LuaMod::m_next_delayed_action_handle++;
 
             // Use pending queue if we're currently iterating to prevent iterator invalidation
-            if (LuaMod::m_is_processing_actions)
+            if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
             {
                 LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
             }
@@ -5324,13 +5360,14 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
+            action.mod = mod;
             action.delay_frames = frames;
             action.frames_remaining = frames;
             action.is_looping = true;
             action.handle = LuaMod::m_next_delayed_action_handle++;
 
             // Use pending queue if we're currently iterating to prevent iterator invalidation
-            if (LuaMod::m_is_processing_actions)
+            if (LuaMod::m_is_processing_actions.load(std::memory_order_acquire) != 0)
             {
                 LuaMod::m_pending_delayed_game_thread_actions.emplace_back(action);
             }
@@ -6614,6 +6651,13 @@ Overloads:
     {
         Output::send(STR("Stopping mod '{}' for uninstall\n"), m_mod_name);
 
+        // MARK THE MOD UNLOADING BEFORE ANYTHING ELSE. The action drains run their swapped-out
+        // lists lock-free, so uninstall's container erase can never reach the copies the game
+        // thread is executing or about to execute; the drains check this flag per action and
+        // skip them (see process_simple_actions). Everything that follows -- erasing queued
+        // actions, lua_close -- is then safe against any drain, on any thread.
+        m_unload_started.store(true, std::memory_order_release);
+
         // Stop the async thread BEFORE acquiring the mutex to avoid deadlock
         // (async thread's callbacks may need the mutex when calling ExecuteInGameThread)
         if (m_async_thread.joinable())
@@ -6676,6 +6720,7 @@ Overloads:
 
         // Now acquire mutex to safely modify shared data structures
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
+
 
         fire_on_lua_stop_for_cpp_mods();
 

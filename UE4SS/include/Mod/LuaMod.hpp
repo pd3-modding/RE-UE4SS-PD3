@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -39,6 +40,10 @@ namespace RC
         LuaMadeSimple::Lua* m_hook_lua = nullptr;
         LuaMadeSimple::Lua* m_main_lua{};
         LuaMadeSimple::Lua* m_async_lua{};
+        // Set as the very first thing uninstall() does. The action drains check it per action
+        // and skip any action owned by this mod, because they run their swapped-out lists
+        // lock-free where uninstall's erase cannot reach them (see SimpleLuaAction.mod).
+        std::atomic<bool> m_unload_started{false};
 
       public:
         enum class ActionType
@@ -53,6 +58,11 @@ namespace RC
             const LuaMadeSimple::Lua* lua;
             int32_t lua_action_function_ref{};
             int32_t lua_action_thread_ref{};
+            // OWNING MOD. The drain runs its swapped-out list lock-free, so when a reload
+            // uninstalls mods mid-list it cannot see these from uninstall's erase; the drain
+            // skips any action whose mod has begun unloading (m_unload_started) instead of
+            // touching a closed Lua state.
+            LuaMod* mod{};
         };
 
         // Status of a delayed action (mirrors UE's ETimerStatus)
@@ -81,6 +91,7 @@ namespace RC
             bool is_retriggerable{false};  // If true, can be reset by calling with same handle
             bool is_looping{false};  // If true, re-schedule after each execution
             bool pause_after_execution{false};  // Pause immediately after current callback returns
+            LuaMod* mod{};  // Owning mod -- see SimpleLuaAction.mod
         };
 
         static inline int64_t m_next_delayed_action_handle{1};
@@ -162,8 +173,14 @@ namespace RC
         static inline std::vector<DelayedGameThreadAction> m_pending_delayed_game_thread_actions{};
         // Pending NotifyOnNewObject callbacks to be processed on game thread
         static inline std::vector<PendingNotifyOnNewObjectCallback> m_pending_notify_on_new_object_callbacks{};
-        // Flag to track if we're currently iterating over action vectors
-        static inline bool m_is_processing_actions{};
+        // DEPTH of in-flight game-thread action drains (engine tick + ProcessEvent), not a
+        // plain flag: a UFunction call inside an action re-enters ProcessEvent and nests a
+        // second drain inside the first, and a flag would have the nested teardown clear it
+        // while the outer drain is still executing Lua. Atomic because uninstall() waits on
+        // it from the unload thread while the game thread decrements it outside the mutex
+        // (the drains only hold m_thread_actions_mutex around the entry increment; the
+        // actions themselves run lock-free).
+        static inline std::atomic<uint32_t> m_is_processing_actions{};
         static inline GameThreadExecutionMethod m_default_game_thread_method{GameThreadExecutionMethod::EngineTick};
         // This is storage that persists through hot-reloads.
         static inline std::unordered_map<std::string, SharedLuaVariable> m_shared_lua_variables{};
