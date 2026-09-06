@@ -6718,6 +6718,35 @@ Overloads:
             }
         }
 
+        // WAIT FOR THE IN-FLIGHT ACTION DRAINS THE SAME WAY -- the drain counterpart of the
+        // hook-callback wait above. The mark-then-skip token stops actions from STARTING once
+        // this mod begins unloading, but it says nothing about the action a drain ALREADY
+        // swapped out and is executing: process_simple_actions runs its swapped list lock-free,
+        // so uninstall reached lua_close under a running action -- the 2026-09-06 12:58 crash
+        // (a queued action's Lua inside FindAllOf, writing to a registry table the close had
+        // freed; the dump's table pointer read back as 0x1). Wait on the drain-depth counter
+        // WITHOUT holding m_thread_actions_mutex: a drain in flight finishes and its teardown's
+        // notify_all wakes us, a drain that starts after the token skips every action and
+        // returns immediately, and the game thread's enqueues -- which take that mutex at every
+        // ExecuteInGameThread -- never block on us, so this cannot recreate the 11:13 hang
+        // (that one waited while HOLDING the mutex the game thread needed). Bounded for the
+        // same reason as the hook wait: still in flight after two seconds is stuck, and a
+        // stuck one delays the reload instead of wedging the game.
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+            auto depth = LuaMod::m_is_processing_actions.load(std::memory_order_acquire);
+            while (depth != 0 && std::chrono::steady_clock::now() < deadline)
+            {
+                LuaMod::m_is_processing_actions.wait(depth, std::memory_order_acquire);
+                depth = LuaMod::m_is_processing_actions.load(std::memory_order_acquire);
+            }
+            if (depth != 0)
+            {
+                Output::send(STR("\t{} game-thread action drain(s) still in flight after 2s; unloading anyway\n"),
+                             depth);
+            }
+        }
+
         // Now acquire mutex to safely modify shared data structures
         std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
 
