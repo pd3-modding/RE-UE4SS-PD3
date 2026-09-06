@@ -4289,7 +4289,7 @@ Overloads:
             // has begun unloading is DEAD: running it, or even luaL_unref on it, touches the
             // closed state (2026-09-06 11:00, luaH_getint on a null registry). Skip both; the
             // ref dies with the state.
-            if (lua_data.mod && lua_data.mod->m_unload_started.load(std::memory_order_acquire))
+            if (lua_data.unload_token && lua_data.unload_token->load(std::memory_order_acquire))
             {
                 continue;
             }
@@ -4441,7 +4441,7 @@ Overloads:
             size_t index{};
             const LuaMadeSimple::Lua* lua{};
             int32_t lua_action_function_ref{};
-            LuaMod* mod{};
+            std::shared_ptr<std::atomic<bool>> unload_token{};
         };
 
         std::vector<ReadyDelayedExec> ready{};
@@ -4499,7 +4499,7 @@ Overloads:
                 }
 
                 action.status = LuaMod::DelayedActionStatus::Executing;
-                ready.push_back(ReadyDelayedExec{i, action.lua, action.lua_action_function_ref, action.mod});
+                ready.push_back(ReadyDelayedExec{i, action.lua, action.lua_action_function_ref, action.unload_token});
             }
         }
 
@@ -4513,7 +4513,7 @@ Overloads:
             // See process_simple_actions: an action of a mod that began unloading is dead --
             // its Lua state may already be closed. Skip the call AND the ref release; the
             // registry entry dies with the state.
-            if (exec.mod && exec.mod->m_unload_started.load(std::memory_order_acquire))
+            if (exec.unload_token && exec.unload_token->load(std::memory_order_acquire))
             {
                 continue;
             }
@@ -4901,7 +4901,7 @@ Overloads:
             const auto func_ref = luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX);
 
             SimpleLuaAction simpleAction{hook_lua, func_ref, lua_thread_registry_index};
-            simpleAction.mod = mod;
+            simpleAction.unload_token = mod->m_unload_started;
             if (method == GameThreadExecutionMethod::EngineTick)
             {
                 // Use pending queue if we're currently iterating to prevent iterator invalidation
@@ -5021,7 +5021,7 @@ Overloads:
                 action.lua = hook_lua;
                 action.lua_action_function_ref = func_ref;
                 action.lua_action_thread_ref = lua_thread_registry_index;
-                action.mod = mod;
+                action.unload_token = mod->m_unload_started;
                 action.method = method;
                 action.delay_ms = delay_ms;
                 action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5057,7 +5057,7 @@ Overloads:
                 action.lua = hook_lua;
                 action.lua_action_function_ref = func_ref;
                 action.lua_action_thread_ref = lua_thread_registry_index;
-                action.mod = mod;
+                action.unload_token = mod->m_unload_started;
                 action.method = method;
                 action.delay_ms = delay_ms;
                 action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5166,7 +5166,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
-            action.mod = mod;
+            action.unload_token = mod->m_unload_started;
             action.method = method;
             action.delay_ms = delay_ms;
             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5222,7 +5222,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
-            action.mod = mod;
+            action.unload_token = mod->m_unload_started;
             action.delay_frames = frames;
             action.frames_remaining = frames;
             action.handle = LuaMod::m_next_delayed_action_handle++;
@@ -5302,7 +5302,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
-            action.mod = mod;
+            action.unload_token = mod->m_unload_started;
             action.method = method;
             action.delay_ms = delay_ms;
             action.execute_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
@@ -5360,7 +5360,7 @@ Overloads:
             action.lua = hook_lua;
             action.lua_action_function_ref = func_ref;
             action.lua_action_thread_ref = lua_thread_registry_index;
-            action.mod = mod;
+            action.unload_token = mod->m_unload_started;
             action.delay_frames = frames;
             action.frames_remaining = frames;
             action.is_looping = true;
@@ -6656,7 +6656,7 @@ Overloads:
         // thread is executing or about to execute; the drains check this flag per action and
         // skip them (see process_simple_actions). Everything that follows -- erasing queued
         // actions, lua_close -- is then safe against any drain, on any thread.
-        m_unload_started.store(true, std::memory_order_release);
+        m_unload_started->store(true, std::memory_order_release);
 
         // Stop the async thread BEFORE acquiring the mutex to avoid deadlock
         // (async thread's callbacks may need the mutex when calling ExecuteInGameThread)

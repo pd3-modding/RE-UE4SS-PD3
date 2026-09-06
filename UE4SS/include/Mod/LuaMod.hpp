@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,7 +44,11 @@ namespace RC
         // Set as the very first thing uninstall() does. The action drains check it per action
         // and skip any action owned by this mod, because they run their swapped-out lists
         // lock-free where uninstall's erase cannot reach them (see SimpleLuaAction.mod).
-        std::atomic<bool> m_unload_started{false};
+        // SHARED, not a plain member: the LuaMod object is deleted when its uninstall
+        // completes, and an action still holding a raw pointer into it would read FREED
+        // memory in the drain (garbage false -> the dead action runs on the closed state --
+        // the 2026-09-06 11:31 crash, luaH_getint inside add_metamethods's __index lambda).
+        std::shared_ptr<std::atomic<bool>> m_unload_started{std::make_shared<std::atomic<bool>>(false)};
 
       public:
         enum class ActionType
@@ -58,11 +63,11 @@ namespace RC
             const LuaMadeSimple::Lua* lua;
             int32_t lua_action_function_ref{};
             int32_t lua_action_thread_ref{};
-            // OWNING MOD. The drain runs its swapped-out list lock-free, so when a reload
-            // uninstalls mods mid-list it cannot see these from uninstall's erase; the drain
-            // skips any action whose mod has begun unloading (m_unload_started) instead of
-            // touching a closed Lua state.
-            LuaMod* mod{};
+            // OWNING MOD'S UNLOAD TOKEN. The drain runs its swapped-out list lock-free, so
+            // when a reload uninstalls mods mid-list it cannot see these from uninstall's
+            // erase; the drain skips any action whose token is set instead of touching a
+            // closed Lua state. Shared so it stays readable after the LuaMod is deleted.
+            std::shared_ptr<std::atomic<bool>> unload_token{};
         };
 
         // Status of a delayed action (mirrors UE's ETimerStatus)
@@ -91,7 +96,7 @@ namespace RC
             bool is_retriggerable{false};  // If true, can be reset by calling with same handle
             bool is_looping{false};  // If true, re-schedule after each execution
             bool pause_after_execution{false};  // Pause immediately after current callback returns
-            LuaMod* mod{};  // Owning mod -- see SimpleLuaAction.mod
+            std::shared_ptr<std::atomic<bool>> unload_token{};  // Owning mod's token -- see SimpleLuaAction.unload_token
         };
 
         static inline int64_t m_next_delayed_action_handle{1};
