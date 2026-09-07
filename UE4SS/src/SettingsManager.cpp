@@ -179,6 +179,7 @@ namespace RC
                 throw std::runtime_error{fmt::format("Invalid value for 'Debug.ToggleGUIKey': {}\n", to_string(toggle_gui_key))};
             }
         }
+        REGISTER_BOOL_SETTING(Debug.ForwardLogToGameConsole, section_debug, ForwardLogToGameConsole)
 
         constexpr static File::CharType section_crash_dump[] = STR("CrashDump");
         REGISTER_BOOL_SETTING(CrashDump.EnableDumping, section_crash_dump, EnableDumping);

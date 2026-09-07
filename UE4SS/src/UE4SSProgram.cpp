@@ -16,6 +16,7 @@
 #include <Profiler/Profiler.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <ExceptionHandling.hpp>
+#include <GameConsoleForwarder.hpp>
 #include <GUI/ConsoleOutputDevice.hpp>
 #include <GUI/GUI.hpp>
 #include <GUI/LiveView.hpp>
@@ -296,6 +297,14 @@ namespace RC
             // Setup the log file
             auto& file_device = Output::set_default_devices<Output::NewFileDevice>();
             file_device.set_file_name_and_path(ensure_str((m_log_directory / m_log_file_name)));
+
+            // Opt-in mirror of every output line into the game's own console. Registered as
+            // another default device, so it sees everything the loader, C++ mods and Lua
+            // print emit. See GameConsoleForwarder.hpp for the write path.
+            if (settings_manager.Debug.ForwardLogToGameConsole)
+            {
+                Output::set_default_devices<Output::GameConsoleDevice>();
+            }
 
             if (const auto ue4ss_mods_paths_var_raw = std::getenv("UE4SS_MODS_PATHS"); ue4ss_mods_paths_var_raw)
             {
@@ -1158,6 +1167,11 @@ namespace RC
         else if (settings_manager.Debug.RenderMode == GUI::RenderMode::GameViewportClientTick)
         {
             Hook::RegisterGameViewportClientTickPostCallback([](auto&,...){gui_render_thread_tick(); }, {false, false, STR("UE4SS"), STR("ImGuiRenderHook")});
+        }
+
+        if (settings_manager.Debug.ForwardLogToGameConsole)
+        {
+            GameConsoleForwarder::initialize();
         }
 
         if (settings_manager.Debug.DebugConsoleEnabled)
