@@ -1,6 +1,7 @@
 #include <ModManagerStore/ModManagerStore.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <optional>
@@ -204,7 +205,12 @@ namespace RC::ModManagerStore
                         value_literal(edit.value));
             case PendingEdit::Kind::ApplyMod:
                 // Fail closed: without a host assertion, requires_host descriptors are skipped
-                // -- exactly MM.apply's own contract when ctx is missing.
+                // -- exactly MM.apply's own contract when ctx is missing. The chunk stays
+                // silent in the per-mod states that hold no schema (the shared library loads
+                // per state, so ~19 copies of PD3ModManager with empty registries see every
+                // edit): the drain's own heartbeat plus MM.apply's ok/skip logs bracket the
+                // path, so a heartbeat with no Lua-side follow-up already means "no state
+                // held the schema".
                 return fmt::format(
                         "local __ok, MM = pcall(require, 'PD3ModManager')\n"
                         "if __ok and type(MM) == 'table' and MM.schema_of and MM.schema_of({0}) then\n"
@@ -347,10 +353,10 @@ namespace RC::ModManagerStore
             ImGui::TextUnformatted(setting.label.c_str());
             ImGui::TableSetColumnIndex(1);
 
-            switch (setting.type == "num" ? 0 : setting.type == "bool" ? 1 :
+            switch (setting.type == "num" || setting.type == "int" ? 0 : setting.type == "bool" ? 1 :
                     setting.type == "enum" ? 2 : 3)
             {
-            case 0: // num
+            case 0: // num | int
             {
                 if (setting.has_min && setting.has_max)
                 {
@@ -360,15 +366,46 @@ namespace RC::ModManagerStore
                     const bool held = widget_held().count(key) != 0;
                     auto& scratch = widget_scratch();
                     auto held_it = scratch.find(key);
-                    float v = (held && held_it != scratch.end()
-                               && held_it->second.kind == SettingValue::Kind::Number)
-                                  ? static_cast<float>(held_it->second.number)
-                                  : static_cast<float>(display->number);
-                    if (ImGui::SliderFloat("##v", &v, static_cast<float>(setting.min),
-                                           static_cast<float>(setting.max)))
+                    const double seeded = (held && held_it != scratch.end()
+                                           && held_it->second.kind == SettingValue::Kind::Number)
+                                              ? held_it->second.number
+                                              : display->number;
+                    if (setting.type == "int")
                     {
-                        widget_scratch()[key] =
-                            SettingValue{.kind = SettingValue::Kind::Number, .number = v};
+                        // The schema declared an integer: render SliderInt, so the drag itself
+                        // is integral instead of free with a snap correction. The int grid the
+                        // widget moves on is [ceil(min), floor(max)].
+                        const int lo = static_cast<int>(std::ceil(setting.min - 1e-6));
+                        const int hi = static_cast<int>(std::floor(setting.max + 1e-6));
+                        int vi = static_cast<int>(seeded + (seeded >= 0.0 ? 0.5 : -0.5));
+                        if (ImGui::SliderInt("##v", &vi, lo, hi))
+                        {
+                            widget_scratch()[key] =
+                                SettingValue{.kind = SettingValue::Kind::Number,
+                                             .number = static_cast<double>(vi)};
+                        }
+                    }
+                    else
+                    {
+                        float v = static_cast<float>(seeded);
+                        if (ImGui::SliderFloat("##v", &v, static_cast<float>(setting.min),
+                                               static_cast<float>(setting.max)))
+                        {
+                            // Snap onto the setting's step grid, same as the Lua registry's
+                            // coerce(): SliderFloat drags free (no step support), and the
+                            // in-flight held value is what the next frame seeds the widget
+                            // from -- so the drag itself has to show the grid, not just the
+                            // submitted value.
+                            if (setting.step > 0.0)
+                            {
+                                v = static_cast<float>(setting.min +
+                                    std::floor((v - setting.min) / setting.step + 0.5) * setting.step);
+                                if (v < static_cast<float>(setting.min)) v = static_cast<float>(setting.min);
+                                if (v > static_cast<float>(setting.max)) v = static_cast<float>(setting.max);
+                            }
+                            widget_scratch()[key] =
+                                SettingValue{.kind = SettingValue::Kind::Number, .number = v};
+                        }
                     }
                     if (ImGui::IsItemActive())
                     {
@@ -387,10 +424,29 @@ namespace RC::ModManagerStore
                 }
                 else
                 {
-                    double v = display->number;
-                    if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue))
+                    if (setting.type == "int")
                     {
-                        submit(SettingValue{.kind = SettingValue::Kind::Number, .number = v});
+                        int vi = static_cast<int>(display->number + (display->number >= 0.0 ? 0.5 : -0.5));
+                        if (ImGui::InputInt("##v", &vi))
+                        {
+                            submit(SettingValue{.kind = SettingValue::Kind::Number,
+                                                .number = static_cast<double>(vi)});
+                        }
+                    }
+                    else
+                    {
+                        double v = display->number;
+                        if (ImGui::InputDouble("##v", &v, 0.0, 0.0, "%.3f", ImGuiInputTextFlags_EnterReturnsTrue))
+                        {
+                            // Same grid, for the free-entry rows (no min/max declared): snap to
+                            // the step anchored at 0 unless the schema anchors it elsewhere.
+                            if (setting.step > 0.0)
+                            {
+                                const double anchor = setting.has_min ? setting.min : 0.0;
+                                v = anchor + std::floor((v - anchor) / setting.step + 0.5) * setting.step;
+                            }
+                            submit(SettingValue{.kind = SettingValue::Kind::Number, .number = v});
+                        }
                     }
                 }
                 break;
@@ -848,6 +904,11 @@ namespace RC::ModManagerStore
             }
             batch.swap(s_pending);
         }
+
+        // The drain's own heartbeat. A button press that produces neither this line nor any
+        // Lua-side line means the tick hook is dead -- distinguishable from every other
+        // silent failure only if the drain says what it did.
+        Output::send(STR("[ModManagerStore] draining {} edit(s)\n"), batch.size());
 
         for (const auto& edit : batch)
         {

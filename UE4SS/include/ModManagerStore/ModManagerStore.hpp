@@ -75,7 +75,7 @@ namespace RC
         {
             std::string id;
             std::string label; // display label, defaulted from id
-            std::string type;  // "num" | "bool" | "enum" | "str" | "text"
+            std::string type;  // "num" | "int" | "bool" | "enum" | "str" | "text"
             double default_number{};
             bool default_bool{};
             std::string default_string{};
