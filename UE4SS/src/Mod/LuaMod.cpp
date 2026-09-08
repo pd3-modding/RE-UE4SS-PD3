@@ -7809,9 +7809,32 @@ Overloads:
                 // TODO: Replace with proper implementation when we have UGameViewportClient and UConsole.
                 //       This should be fairly cross-game & cross-engine-version compatible even without the proper implementation.
                 //       This is because I don't think they've changed the layout here and we have a reflected property right before the unreflected one that we're looking for.
-                Unreal::UObject** console = static_cast<Unreal::UObject**>(context->GetValuePtrByPropertyName(FromCharTypePtr<TCHAR>(STR("ViewportConsole"))));
-                auto* default_texture_white = std::bit_cast<Unreal::TArray<Unreal::FString>*>(
-                        static_cast<uint8_t*>((*console)->GetValuePtrByPropertyNameInChain(FromCharTypePtr<TCHAR>(STR("DefaultTexture_White")))) + 0x8);
+                //
+                // EVERY POINTER HERE IS CHECKED, because none of them is guaranteed. This
+                // handler runs for whatever object ProcessConsoleExec routed the command to --
+                // the exec chain walks the player controller, the local player, the game mode
+                // and the world, and only the viewport client has a ViewportConsole property.
+                // GetValuePtrByPropertyName returns nullptr for all the others, and the
+                // unguarded `*console` below was a hard null dereference: typing a bare `clear`
+                // in PAYDAY 3 crashed the game every time (two UECC dumps, 2026-09-08, both
+                // "EXCEPTION_ACCESS_VIOLATION reading address 0x0" attributed to this line).
+                // Bail out to the normal exec path rather than claiming a command we cannot
+                // service.
+                if (!context)
+                {
+                    return false;
+                }
+                auto** console = static_cast<Unreal::UObject**>(context->GetValuePtrByPropertyName(FromCharTypePtr<TCHAR>(STR("ViewportConsole"))));
+                if (!console || !*console)
+                {
+                    return false;
+                }
+                auto* white_value_ptr = (*console)->GetValuePtrByPropertyNameInChain(FromCharTypePtr<TCHAR>(STR("DefaultTexture_White")));
+                if (!white_value_ptr)
+                {
+                    return false;
+                }
+                auto* default_texture_white = std::bit_cast<Unreal::TArray<Unreal::FString>*>(static_cast<uint8_t*>(white_value_ptr) + 0x8);
                 auto* scrollback = std::bit_cast<int32_t*>(std::bit_cast<uint8_t*>(default_texture_white) + 0x10);
                 default_texture_white->SetNum(0);
                 default_texture_white->SetMax(0);
