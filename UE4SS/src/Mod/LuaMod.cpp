@@ -48,6 +48,7 @@
 #include <JMapGenerator/JMapGenerator.hpp>
 #include <USMapGenerator/Generator.hpp>
 #include <Unreal/Core/HAL/Platform.hpp>
+#include <Unreal/Core/HAL/UnrealMemory.hpp>
 #include <Unreal/FFrame.hpp>
 #include <Unreal/FURL.hpp>
 #include <Unreal/FWorldContext.hpp>
@@ -2921,6 +2922,64 @@ Overloads:
                 std::memcpy(std::bit_cast<void*>(destination), std::bit_cast<void*>(source), size);
             }
             return 0;
+        });
+
+        // Resize a TArray that LIVES IN THE GAME, through the game's own allocator. NativeAlloc
+        // above is the loader's CRT heap: memory the engine may later free or realloc itself
+        // must never come from it, and a game-side container is exactly that case.
+        //
+        // Reads {Data, Num, Max} at 'header' (a TArray with the default heap allocator; an
+        // inline/fixed allocator is a different layout and must not be passed), reallocates the
+        // data to 'new_num' elements, ZEROES any grown region -- so a grown element's own
+        // FString/TArray members start empty and valid rather than as garbage pointers -- then
+        // writes Data/Num/Max and returns the new data pointer.
+        //
+        // new_num = 0 frees the allocation and nulls the header. Shrinking frees nothing the
+        // removed elements pointed AT: resize those inner arrays to 0 first, or they leak. On
+        // allocation failure the header is left untouched and 0 is returned. It cannot check
+        // that 'header' really is a TArray -- a wrong address is an uncatchable access violation.
+        lua.register_function("NativeArrayResize", [](const LuaMadeSimple::Lua& lua) -> int {
+            const auto header = static_cast<uintptr_t>(lua.get_integer());
+            const auto element_size = static_cast<int64_t>(lua.get_integer());
+            const auto new_num = static_cast<int64_t>(lua.get_integer());
+            // Bounds, so a garbage argument is a nil return instead of a wild allocation.
+            if (!header || element_size <= 0 || element_size > 0x10000 || new_num < 0 || new_num > 0x100000)
+            {
+                lua.set_integer(0);
+                return 1;
+            }
+
+            auto* data_field = std::bit_cast<void**>(header);
+            auto* num_field = std::bit_cast<int32_t*>(header + 8);
+            auto* max_field = std::bit_cast<int32_t*>(header + 12);
+            void* old_data = *data_field;
+            // A null Data means an empty array whatever Num claims; trust the pointer.
+            const int64_t old_num = old_data && *num_field > 0 ? *num_field : 0;
+
+            void* new_data{};
+            try
+            {
+                new_data = Unreal::FMemory::Realloc(old_data, static_cast<size_t>(new_num * element_size));
+            }
+            catch (const std::exception& e)
+            {
+                lua.throw_error(std::format("NativeArrayResize: {}", e.what()));
+            }
+            if (new_num > 0 && !new_data)
+            {
+                lua.set_integer(0);
+                return 1;
+            }
+            if (new_num > old_num)
+            {
+                std::memset(std::bit_cast<uint8_t*>(new_data) + old_num * element_size, 0, (new_num - old_num) * element_size);
+            }
+
+            *data_field = new_data;
+            *num_field = static_cast<int32_t>(new_num);
+            *max_field = static_cast<int32_t>(new_num);
+            lua.set_integer(std::bit_cast<int64_t>(new_data));
+            return 1;
         });
 
         lua.register_function("NativeReadI32", [](const LuaMadeSimple::Lua& lua) -> int {
