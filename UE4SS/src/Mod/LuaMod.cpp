@@ -181,6 +181,17 @@ namespace RC
 
     static auto lua_unreal_script_function_hook_pre(Unreal::UnrealScriptFunctionCallableContext context, void* custom_data) -> void
     {
+        // MODS ARE COMING UP OR GOING DOWN on the event-loop thread -- see
+        // LuaMod::m_mods_transitioning. A mod registers its hooks from main.lua, so between that
+        // registration and the end of main.lua the game thread can fire this callback into a state
+        // the event-loop thread is still executing. The unload token does not cover it: the mod is
+        // arriving, not leaving. The post hook below bails on the same condition, so pre and post
+        // stay paired.
+        if (LuaMod::mods_are_transitioning())
+        {
+            return;
+        }
+
         TRY([&]() {
             // Fetch the data corresponding to this UFunction
             auto& lua_data = *static_cast<LuaUnrealScriptFunctionData*>(custom_data);
@@ -293,6 +304,15 @@ namespace RC
 
     static auto lua_unreal_script_function_hook_post(Unreal::UnrealScriptFunctionCallableContext context, void* custom_data) -> void
     {
+        // Paired with the same bail in lua_unreal_script_function_pre: if the pre hook did not
+        // enter Lua, the post hook must not either -- it would pop a stack nothing pushed. Also
+        // keeps the deferred unregistration below off the event-loop thread's toes while it is
+        // rebuilding the hook containers.
+        if (LuaMod::mods_are_transitioning())
+        {
+            return;
+        }
+
         // Fetch the data corresponding to this UFunction
         auto& lua_data = *static_cast<LuaUnrealScriptFunctionData*>(custom_data);
 
@@ -4328,6 +4348,15 @@ Overloads:
 
     static auto process_simple_actions(std::vector<LuaMod::SimpleLuaAction>& actions) -> void
     {
+        // MODS ARE COMING UP OR GOING DOWN ON THE EVENT-LOOP THREAD -- keep out of every Lua
+        // state until they are settled. Returning BEFORE the swap below leaves the queue intact,
+        // so these actions run on the next tick rather than being lost. See
+        // LuaMod::m_mods_transitioning.
+        if (LuaMod::mods_are_transitioning())
+        {
+            return;
+        }
+
         std::vector<LuaMod::SimpleLuaAction> to_run{};
         {
             std::lock_guard<std::recursive_mutex> guard{LuaMod::m_thread_actions_mutex};
@@ -4382,6 +4411,13 @@ Overloads:
     // This MUST run on the game thread because Lua is NOT thread-safe
     static auto process_pending_notify_on_new_object_callbacks() -> void
     {
+        // See process_simple_actions: no Lua while mods install or uninstall. The pending list is
+        // left untouched, so these callbacks fire on the next tick instead.
+        if (LuaMod::mods_are_transitioning())
+        {
+            return;
+        }
+
         struct PendingNotifyExec
         {
             uint64_t callback_id{};
@@ -4495,6 +4531,13 @@ Overloads:
     template <GameThreadExecutionMethod Executor>
     static auto process_delayed_actions(std::vector<LuaMod::DelayedGameThreadAction>& actions) -> void
     {
+        // See process_simple_actions: no Lua while mods install or uninstall. A delayed action
+        // keeps its status and simply becomes ready a tick later.
+        if (LuaMod::mods_are_transitioning())
+        {
+            return;
+        }
+
         struct ReadyDelayedExec
         {
             size_t index{};
@@ -6709,6 +6752,13 @@ Overloads:
     auto LuaMod::uninstall() -> void
     {
         Output::send(STR("Stopping mod '{}' for uninstall\n"), m_mod_name);
+
+        // KEEP THE GAME THREAD OUT OF EVERY MOD'S LUA FOR THE WHOLE TEARDOWN. The per-mod unload
+        // token below covers this mod's queued ACTIONS; this covers the rest -- and it makes the
+        // two waits further down converge instead of racing a fresh drain each time they look.
+        // Nested inside queue_reinstall_mods' own guard during a reload; standalone on the
+        // single-mod uninstall and shutdown paths. See LuaMod::m_mods_transitioning.
+        LuaMod::ScopedModTransition no_lua_from_the_game_thread{};
 
         // MARK THE MOD UNLOADING BEFORE ANYTHING ELSE. The action drains run their swapped-out
         // lists lock-free, so uninstall's container erase can never reach the copies the game

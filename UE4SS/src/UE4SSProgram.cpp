@@ -1811,6 +1811,11 @@ namespace RC
     auto UE4SSProgram::start_lua_mods() -> void
     {
         ProfilerScope();
+        // Every mod's main.lua runs here, on the event-loop thread, while the game thread ticks.
+        // Raised in queue_reinstall_mods too -- the counter nests -- so that the UNINSTALL half of
+        // a reload is covered by the same window. This one covers the initial startup and any
+        // other caller. See LuaMod::m_mods_transitioning.
+        LuaMod::ScopedModTransition no_lua_from_the_game_thread{};
         auto error_message = start_mods<LuaMod>();
         if (!error_message.empty())
         {
@@ -1926,6 +1931,14 @@ namespace RC
         ProfilerScope();
         Output::send(STR("Re-installing all mods\n"));
 
+        // KEEP THE GAME THREAD OUT OF LUA FOR THE WHOLE TRANSITION, not just the uninstall.
+        // m_pause_events_processing below pauses THIS thread's event loop; it says nothing to the
+        // game thread, which keeps ticking and draining actions and firing hooks while
+        // start_lua_mods() runs every mod's main.lua right here. See LuaMod::m_mods_transitioning
+        // for the crash that proved it (2026-09-11 09:50, an engine-tick drain in lua_rawget ~200ms
+        // after the reload reported success).
+        LuaMod::ScopedModTransition no_lua_from_the_game_thread{};
+
         // Stop processing events while stuff isn't properly setup
         m_pause_events_processing = true;
 
@@ -1977,6 +1990,10 @@ namespace RC
         std::filesystem::path mod_path = mod->get_path();
 
         Output::send(STR("Reinstalling mod: {}\n"), mod_name);
+
+        // Same reason as queue_reinstall_mods: start_mod() below runs main.lua on THIS thread
+        // while the game thread ticks. See LuaMod::m_mods_transitioning.
+        LuaMod::ScopedModTransition no_lua_from_the_game_thread{};
 
         // Pause event processing for safety
         m_pause_events_processing = true;

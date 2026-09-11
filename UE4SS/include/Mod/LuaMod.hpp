@@ -186,6 +186,58 @@ namespace RC
         // (the drains only hold m_thread_actions_mutex around the entry increment; the
         // actions themselves run lock-free).
         static inline std::atomic<uint32_t> m_is_processing_actions{};
+        // NON-ZERO while mods are being installed or uninstalled on the UE4SS EVENT-LOOP thread.
+        // While it is raised the GAME thread must not enter ANY mod's Lua state.
+        //
+        // WHY. queue_reinstall_mods() runs uninstall_mods() and then start_lua_mods() on the event
+        // loop, and start_lua_mods() executes every mod's main.lua THERE. The game thread carries
+        // on ticking the whole time, so the instant a starting mod registers a hook or queues an
+        // ExecuteInGameThread action, the game thread can call into that same lua_State while the
+        // event-loop thread is still running main.lua inside it. Two OS threads, one lua_State,
+        // whose stack, GC and string table are all unsynchronised.
+        //
+        // That is the 2026-09-11 09:50 crash: an engine-tick drain (engine_tick_hook ->
+        // process_simple_actions -> call_function) faulted in lua_rawget reading a table pointer
+        // of 0x2f2765eb481, ~200ms after "All mods re-installed", with no unload warning in the
+        // log because nothing was unloading any more -- the mods were STARTING.
+        //
+        // The existing guards do not cover this. The unload token and m_hook_callbacks_in_flight
+        // both answer "is this mod going away", and a mod coming UP is not. m_thread_actions_mutex
+        // is held across uninstall's erase and lua_close but NOT across start_lua_mods.
+        //
+        // A COUNTER, NOT A MUTEX, deliberately. Holding m_thread_actions_mutex across mod startup
+        // would block the async loading threads, which take that same mutex at every
+        // StaticConstructObject -- a mod that force-loads an asset from main.lua would deadlock
+        // the loader exactly as UECC-7357EC did. This flag makes the game thread SKIP Lua and
+        // carry on; queued actions simply stay queued (the drains return before swapping the list
+        // out, so nothing is dropped) and hooks no-op for the few hundred milliseconds a reload
+        // takes. A counter rather than a bool because queue_reinstall_mods() raises it and then
+        // calls start_lua_mods(), which raises it again.
+        static inline std::atomic<uint32_t> m_mods_transitioning{};
+
+        // RAII for m_mods_transitioning, so an exception out of mod startup cannot leave the game
+        // thread permanently locked out of Lua.
+        struct ScopedModTransition
+        {
+            ScopedModTransition()
+            {
+                LuaMod::m_mods_transitioning.fetch_add(1, std::memory_order_acq_rel);
+            }
+            ~ScopedModTransition()
+            {
+                LuaMod::m_mods_transitioning.fetch_sub(1, std::memory_order_acq_rel);
+                LuaMod::m_mods_transitioning.notify_all();
+            }
+            ScopedModTransition(const ScopedModTransition&) = delete;
+            ScopedModTransition& operator=(const ScopedModTransition&) = delete;
+        };
+
+        // True when the game thread must keep out of every mod's Lua state right now.
+        static auto mods_are_transitioning() -> bool
+        {
+            return LuaMod::m_mods_transitioning.load(std::memory_order_acquire) != 0;
+        }
+
         static inline GameThreadExecutionMethod m_default_game_thread_method{GameThreadExecutionMethod::EngineTick};
         // This is storage that persists through hot-reloads.
         static inline std::unordered_map<std::string, SharedLuaVariable> m_shared_lua_variables{};
