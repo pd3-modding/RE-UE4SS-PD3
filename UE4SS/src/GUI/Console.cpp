@@ -130,7 +130,9 @@ namespace RC::GUI
         /**/
 
         std::lock_guard<std::mutex> guard(m_lines_mutex);
-        m_text_editor.Render("TextEditor", {-16.0f, -31.0f + -8.0f});
+        // Fills the tab: the main window is sized to the client area now, so there is no
+        // off-screen strip left to subtract (GUI.cpp, get_client_size).
+        m_text_editor.Render("TextEditor", {0.0f, 0.0f});
 
         ImGui_AutoScroll("TextEditor", &m_previous_max_scroll_y);
         //*/

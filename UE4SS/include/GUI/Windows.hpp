@@ -18,6 +18,7 @@ namespace RC::GUI
         auto cleanup() -> void override;
         auto get_window_handle() -> void* override;
         auto get_window_size() -> WindowSize override;
+        auto get_client_size() -> WindowSize override;
         auto get_window_position() -> WindowPosition override;
         auto on_gfx_backend_set() -> void override;
     };

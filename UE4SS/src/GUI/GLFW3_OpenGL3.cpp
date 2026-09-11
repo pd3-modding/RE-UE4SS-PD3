@@ -117,6 +117,13 @@ namespace RC::GUI
         return {w + left + right, h + top + bottom};
     }
 
+    auto Backend_GLFW3_OpenGL3::get_client_size() -> WindowSize
+    {
+        int w, h;
+        glfwGetWindowSize(m_window, &w, &h);
+        return {w, h};
+    }
+
     auto Backend_GLFW3_OpenGL3::get_window_position() -> WindowPosition
     {
         int left, top, right, bottom;

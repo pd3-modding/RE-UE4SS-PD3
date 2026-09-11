@@ -89,6 +89,13 @@ namespace RC::GUI
         {
             return {};
         };
+        // The DRAWABLE area, frame excluded -- what ImGui must be sized to. get_window_size()
+        // is the OUTER size, which is what CreateWindow takes and what the ini persists, so
+        // the two are not interchangeable. Defaults to the outer size for a frameless backend.
+        virtual auto get_client_size() -> WindowSize
+        {
+            return get_window_size();
+        };
         virtual auto get_window_position() -> WindowPosition
         {
             return {};
@@ -128,6 +135,11 @@ namespace RC::GUI
         virtual auto cleanup() -> void = 0;
         virtual auto get_window_handle() -> void* = 0;
         virtual auto get_window_size() -> WindowSize = 0;
+        // See GfxBackendBase::get_client_size -- the drawable area, not the outer window.
+        virtual auto get_client_size() -> WindowSize
+        {
+            return get_window_size();
+        }
         virtual auto get_window_position() -> WindowPosition = 0;
         virtual auto on_gfx_backend_set() -> void = 0;
     };

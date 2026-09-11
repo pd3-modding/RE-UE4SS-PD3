@@ -121,6 +121,14 @@ namespace RC::GUI
                 static_cast<int32_t>(current_window_rect.bottom - current_window_rect.top)};
     }
 
+    auto Backend_Windows::get_client_size() -> WindowSize
+    {
+        RECT current_client_rect{};
+        GetClientRect(s_hwnd, &current_client_rect);
+        return {static_cast<int32_t>(current_client_rect.right - current_client_rect.left),
+                static_cast<int32_t>(current_client_rect.bottom - current_client_rect.top)};
+    }
+
     auto Backend_Windows::get_window_position() -> WindowPosition
     {
         RECT current_window_rect{};

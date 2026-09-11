@@ -2283,7 +2283,7 @@ namespace RC::GUI
 
     auto LiveView::render_info_panel() -> void
     {
-        ImGui::BeginChild("LiveView_InfoPanel", {-16.0f, m_bottom_size}, true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::BeginChild("LiveView_InfoPanel", {0.0f, m_bottom_size}, true, ImGuiWindowFlags_HorizontalScrollbar);
 
         size_t next_object_index_to_select{};
 
@@ -3256,18 +3256,20 @@ namespace RC::GUI
             ImGui::SetClipboardText(to_string(result).c_str());
         }
 
-        // Y - Windows title bar offset - Bottom window margin - Splitter height
-        auto split_pane_height = ImGui::GetContentRegionAvail().y - 31.0f - 8.0f - 4.0f;
+        // Y - Splitter height. The title-bar and bottom-margin terms are gone: the main window
+        // is sized to the client area now, so the available region is the visible region
+        // (GUI.cpp, get_client_size).
+        auto split_pane_height = ImGui::GetContentRegionAvail().y - 4.0f;
         if (m_bottom_size > 0 && m_bottom_size + m_top_size != split_pane_height)
         {
             // Window height changed, scale panes by ratio
             m_top_size = std::max(ImGui::GetFrameHeight(), std::round(split_pane_height * (m_top_size / (m_top_size + m_bottom_size))));
         }
         m_bottom_size = std::max(ImGui::GetFrameHeight(), split_pane_height - m_top_size);
-        ImGui_Splitter(false, 4.0f, &m_top_size, &m_bottom_size, ImGui::GetFrameHeight(), ImGui::GetFrameHeight(), -16.0f);
+        ImGui_Splitter(false, 4.0f, &m_top_size, &m_bottom_size, ImGui::GetFrameHeight(), ImGui::GetFrameHeight(), -1.0f);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0.156f, 0.156f, 0.156f, 1.0f});
-        ImGui::BeginChild("LiveView_TreeView", {-16.0f, m_top_size}, true);
+        ImGui::BeginChild("LiveView_TreeView", {0.0f, m_top_size}, true);
 
         auto do_iteration = [&](int start, int end, const std::vector<UObject*>* objects_to_draw_ptr = nullptr) {
             if (!objects_to_draw_ptr || objects_to_draw_ptr->empty())
@@ -3443,7 +3445,7 @@ namespace RC::GUI
             s_watches_loaded_from_disk = true;
         }
 
-        ImGui::BeginChild("watch_render_frame", {-16.0f, -31.0f + -8.0f});
+        ImGui::BeginChild("watch_render_frame", {0.0f, 0.0f});
 
         if (ImGui::Button("All Off"))
         {

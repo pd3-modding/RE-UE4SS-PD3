@@ -71,7 +71,12 @@ namespace RC::GUI
             }
 
             ImGui::SetNextWindowPos({0, 0});
-            auto current_window_size = m_os_backend->is_valid() ? m_os_backend->get_window_size() : m_gfx_backend->get_window_size();
+            // THE CLIENT SIZE, not the window size. The position above is the client origin,
+            // so sizing from the outer rect pushed the window's bottom ~39px (title bar) and
+            // right ~16px (borders) off-screen, and every panel had to subtract those numbers
+            // back out by hand -- a page that did not, or a new one that forgets, draws its
+            // last row and the end of its scrollbar where they cannot be seen.
+            auto current_window_size = m_os_backend->is_valid() ? m_os_backend->get_client_size() : m_gfx_backend->get_client_size();
             ImGui::SetNextWindowSize({static_cast<float>(current_window_size.x), static_cast<float>(current_window_size.y)});
             ImGui::Begin("MainWindow",
                          &show_window,

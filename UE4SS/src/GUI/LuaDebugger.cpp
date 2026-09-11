@@ -1643,7 +1643,11 @@ namespace RC::GUI
 
         ImGui::Separator();
         
-        float panel_height = ImGui::GetContentRegionAvail().y - scaled(31.0f) - scaled(8.0f);
+        // The whole remaining region: the main window is sized to the client area now, so
+        // there is no off-screen strip to subtract (GUI.cpp, get_client_size). The old
+        // scaled(31)+scaled(8) was doubly wrong -- the title bar it stood for is an OS pixel
+        // count that does not move with the GUI font scaling.
+        float panel_height = ImGui::GetContentRegionAvail().y;
 
         // Split layout: left side for state list, right side for details
         float left_panel_width = std::max(scaled(150.0f), ImGui::GetContentRegionAvail().x * 0.2f);
@@ -1667,7 +1671,7 @@ namespace RC::GUI
         ImGui::SameLine();
 
         // Right panel - Tabs
-        ImGui::BeginChild("RightPanel", ImVec2(scaled(-16.0f), panel_height), false);
+        ImGui::BeginChild("RightPanel", ImVec2(0.0f, panel_height), false);
 
         if (ImGui::BeginTabBar("LuaDebuggerTabs"))
         {
