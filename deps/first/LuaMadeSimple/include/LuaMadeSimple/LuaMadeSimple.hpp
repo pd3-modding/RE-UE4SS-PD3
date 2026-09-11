@@ -751,6 +751,26 @@ namespace RC::LuaMadeSimple
         template <typename ObjectType>
         [[nodiscard]] auto get_userdata(int32_t force_index = 1, bool preserve_stack = false) const -> ObjectType&
         {
+            // THE TYPE TAG CANNOT DETECT A NON-USERDATA VALUE, so check the Lua type first.
+            // lua_getiuservalue's api_check is compiled out in release, so on a table/string/
+            // number it pushes nil (or garbage), get_integer turns that into 0 -- and 0 IS
+            // LuaOwnedStackObject. The "invalid type" branch below is therefore unreachable
+            // for the one case that matters: lua_touserdata then returns nullptr and the
+            // caller dereferences a null reference. That is an unprotected native AV, not a
+            // Lua error, so pcall cannot catch it. Passing a Lua table where an FName was
+            // expected took the game down this way (2026-09-11, AV reading 0x70 in
+            // push_nameproperty via call_ufunction_from_lua).
+            if (lua_type(get_lua_state(), force_index) != LUA_TUSERDATA) [[unlikely]]
+            {
+                luaL_traceback(get_lua_state(),
+                               get_lua_state(),
+                               fmt::format("[get_userdata] Expected userdata but got '{}'",
+                                           lua_typename(get_lua_state(), lua_type(get_lua_state(), force_index)))
+                                       .c_str(),
+                               0);
+                throw std::runtime_error{"See traceback"};
+            }
+
             lua_getiuservalue(get_lua_state(), force_index, 2);
             int64_t userdata_internal_type = get_integer(-1);
 

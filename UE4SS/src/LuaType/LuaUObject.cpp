@@ -1668,6 +1668,10 @@ namespace RC::LuaType
                 *name = Unreal::FName{ensure_str(params.lua.get_string(params.stored_at_index))};
                 return;
             }
+            if (!params.lua.is_userdata(params.stored_at_index))
+            {
+                params.throw_error("push_nameproperty", "Value must be FName or string");
+            }
             auto& lua_object = params.lua.get_userdata<LuaType::FName>(params.stored_at_index);
             *name = lua_object.get_local_cpp_object();
             return;
@@ -1707,6 +1711,10 @@ namespace RC::LuaType
             {
                 text->SetString(Unreal::FString{ensure_str(params.lua.get_string(params.stored_at_index))});
                 return;
+            }
+            if (!params.lua.is_userdata(params.stored_at_index))
+            {
+                params.throw_error("push_textproperty", "Value must be FText or string");
             }
             auto& lua_other_object = params.lua.get_userdata<LuaType::FText>(params.stored_at_index);
             text->SetString(std::move(lua_other_object.get_local_cpp_object().ToFString()));
@@ -1873,6 +1881,10 @@ namespace RC::LuaType
             {
                 *soft_ptr = Unreal::FSoftObjectPtr{Unreal::FSoftObjectPath{Unreal::FString{ensure_str(params.lua.get_string(params.stored_at_index))}}};
                 return;
+            }
+            if (!params.lua.is_userdata(params.stored_at_index))
+            {
+                params.throw_error("push_softobjectproperty", "Value must be TSoftObjectPtr or string");
             }
             auto& lua_object = params.lua.get_userdata<LuaType::TSoftObjectPtr>(params.stored_at_index);
             *soft_ptr = lua_object.get_local_cpp_object();
