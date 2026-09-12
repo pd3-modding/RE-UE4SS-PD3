@@ -85,6 +85,17 @@ namespace RC
     LuaMadeSimple::Lua* LuaStatics::console_executor{};
     bool LuaStatics::console_executor_enabled{};
 
+    // ONLY VALID ON THE STATE THAT IS CALLING YOU, FROM ITS OWN THREAD. Two separate reasons, and
+    // NEITHER holds on a teardown path:
+    //
+    // 1. It runs Lua. The global read, the userdata typecheck and lua.throw_error can each raise a
+    //    Lua error, and raised with no protected call on the C++ stack -- which is exactly what
+    //    uninstall() is -- luaD_throw finds no errorJmp and calls abort(): "Abort signal received",
+    //    CrashType Assert, no UE4SS minidump because UE's handler gets there first.
+    // 2. It leaves the value on the stack. Deliberate: see below.
+    //
+    // Use LuaMod::owns_lua_state to answer "whose callback is this", and see its definition for the
+    // two crashes -- one from throwing here, one from balancing the push -- that wrote this rule.
     auto get_mod_ref(const LuaMadeSimple::Lua& lua) -> LuaMod*
     {
         if (lua_getglobal(lua.get_lua_state(), "ModRef") == LUA_TNIL)
@@ -1374,7 +1385,18 @@ namespace RC
     // A NULL OWNER IS MEANINGFUL, not a degraded fallback. LuaMod::uninstall only ever touches
     // entries whose `mod == this`, so an MCP-registered hook is invisible to every mod unload and
     // survives a reload -- which is correct, because the executor state is never closed. The flip
-    // side is that nothing reclaims it either: it must be dropped with UnregisterHook.
+    // side is that nothing reclaims it either.
+    //
+    // TWO TRAPS LIVE HERE, both paid for on 2026-09-12. The first: "invisible to every mod
+    // unload" was only true of the INTENT -- erase_from_container re-derived the owner by reading
+    // 'ModRef' back out of every entry's state, so a null-owner entry aborted the process at the
+    // next reload (UECC-1D78743E, a live heist; then UECC-0CAACA75 from the first attempt to fix
+    // it). Ownership is now a pointer comparison, LuaMod::owns_lua_state -- do not put ANY Lua
+    // call back on a teardown path. The second: `UnregisterHook` is registered in
+    // setup_lua_global_functions_internal's is_true_mod branch, so it does NOT exist in the
+    // executor state -- `type(UnregisterHook) == "nil"` there -- and a hook registered from an
+    // eval consequently cannot be taken back at all. Hence the warning below: a hook laid from
+    // that state is permanent for the life of the process.
     struct HookContext
     {
         LuaMod* owner{};                      // null for the MCP executor state
@@ -1390,6 +1412,13 @@ namespace RC
         lua_pop(lua_state, 1);
         if (!has_mod_ref)
         {
+            // Say it out loud, every time. This is the only warning anyone gets that the hook
+            // they just laid outlives every reload and cannot be removed from this state.
+            Output::send<LogLevel::Warning>(
+                STR("[hook] registered from a Lua state with no ModRef (the MCP executor). It is "
+                    "owned by no mod, so it survives every mod reload, keeps firing for the life "
+                    "of the process, and UnregisterHook does not exist in this state to drop it. "
+                    "Probe with calls rather than hooks.\n"));
             // No hook thread: a mod gets one so its callbacks are off the main stack and can be
             // torn down wholesale, neither of which applies to a state that never goes away.
             return {nullptr, const_cast<LuaMadeSimple::Lua*>(&lua), LUA_NOREF, true};
@@ -6586,7 +6615,9 @@ Overloads:
     {
         for (const auto& callback_data : m_mod_unload_callbacks)
         {
-            if (callback_data.lua == nullptr || get_mod_ref(*callback_data.lua) != this)
+            // owns_lua_state, never get_mod_ref: a foreign state here is somebody else's callback
+            // to skip, and touching its Lua from the unload path aborts the process.
+            if (!owns_lua_state(callback_data.lua))
             {
                 continue;
             }
@@ -6738,7 +6769,11 @@ Overloads:
                     return *it;
                 }
             }();
-            if (get_mod_ref(*data.lua) == mod)
+            // POINTER COMPARISON, NEVER A LOOKUP INSIDE THE STATE. Re-deriving the owner by
+            // reading 'ModRef' out of every entry's lua_State is what aborted the process twice
+            // on 2026-09-12; owns_lua_state answers the same question without entering Lua at
+            // all. See LuaMod::owns_lua_state.
+            if (mod && mod->owns_lua_state(data.lua))
             {
                 it = container.erase(it);
             }
@@ -7038,6 +7073,48 @@ Overloads:
     auto LuaMod::get_lua_state() const -> lua_State*
     {
         return lua().get_lua_state();
+    }
+
+    // "IS THIS CALLBACK MINE?" -- and the answer must never involve running Lua.
+    //
+    // Every static callback container (NotifyOnNewObject, the console/exec hooks, LoadMap,
+    // BeginPlay, the command tables, RegisterModUnload, the script hooks) is shared by all mods
+    // and stores only the Lua state the callback's ref lives in. uninstall() has to pick its own
+    // entries out of that, and for years it did so by reading the 'ModRef' global back out of
+    // each entry's state. Both spellings of that idea took the process down on 2026-09-12:
+    //
+    //   get_mod_ref  -> throws on a state with no ModRef, which the MCP executor state legally is
+    //                   (get_hook_context registers null-owner hooks from it on purpose). The
+    //                   Lua error unwinds out of the erase loop on the event-loop thread and
+    //                   abort() ends the process. UECC-1D78743E, mid-heist.
+    //   try_get_mod_ref -> returned nullptr instead of throwing, but balanced its lua_getglobal
+    //                   with a lua_pop, and lua_pop is lua_settop. lua_settop resolves indices
+    //                   against L->ci and closes any to-be-closed slot above the new top -- both
+    //                   properties of the frame the state is currently in. On a FOREIGN, IDLE
+    //                   state poked from the unload thread we own no frame there, so the tbc
+    //                   branch fired and tried to call a __close handler that was not a function:
+    //                   lua_settop -> luaF_close -> prepcallclosemth -> luaG_callerror ->
+    //                   luaD_throw -> abort. UECC-0CAACA75, on the FIRST mod of the reload.
+    //                   (Stock's unbalanced push never crashed only because lua_getglobal's push
+    //                   path consults neither ci nor tbclist. It was leaking a stack slot per
+    //                   entry per mod, which is its own bug -- this removes that too.)
+    //
+    // The question was never really about Lua. A mod owns exactly four states, it knows all four
+    // by pointer, and they are all still alive at this point in uninstall() (m_hook_lua is nulled
+    // and m_lua closed further down). So compare pointers: no Lua error is reachable, nothing is
+    // pushed, and it works identically whether the other state is a mod's, the MCP executor's,
+    // the console executor's, or already dead. A state that belongs to nobody matches nobody and
+    // its callback is skipped, which is what the null-owner design always meant to say.
+    //
+    // Null is not ownership: m_hook_lua/m_main_lua/m_async_lua are null before start_mod() and
+    // m_hook_lua is null again after uninstall(), so a null argument must not match them.
+    auto LuaMod::owns_lua_state(const LuaMadeSimple::Lua* state) const -> bool
+    {
+        if (!state)
+        {
+            return false;
+        }
+        return state == &m_lua || state == m_hook_lua || state == m_main_lua || state == m_async_lua;
     }
 
     auto static start_console_lua_executor() -> void

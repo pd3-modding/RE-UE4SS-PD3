@@ -1084,9 +1084,40 @@ namespace RC::LuaMadeSimple
         }
     }
 
+    // THE LAST CHANCE TO JUMP OUT INSTEAD OF abort().
+    //
+    // LuaRaw is compiled as C++ (LANGUAGE CXX), so Lua raises errors by throwing. But an error
+    // raised with no protected call anywhere -- lua_getglobal, lua_settop or a metamethod called
+    // straight from C++, outside any pcall -- has nothing to throw TO, and luaD_throw's else
+    // branch calls the panic function and then abort(). abort() is not an exception: neither
+    // RC::TRY nor UE's handler nor UE4SS's own minidump writer ever sees it, so the process
+    // vanishes and leaves a CrashType=Assert context and nothing else to read.
+    //
+    // That is precisely how two mod reloads ended a live session on 2026-09-12: one stray
+    // lua_settop on a foreign, idle lua_State from the unload thread (UECC-0CAACA75, and
+    // UECC-1D78743E before it from a throwing lookup on the same path). Those specific calls are
+    // gone -- see LuaMod::owns_lua_state -- but the class of bug is one careless line away in any
+    // future C++-to-Lua boundary, and the punishment for it should not be the user's heist.
+    //
+    // Lua documents this hook as exactly that escape ("last chance to jump out"): throwing from
+    // it unwinds through Lua's own frames, which LUAI_THROW already requires to be
+    // exception-safe, and lands in whatever RC::TRY or catch the C++ caller already has. The
+    // reload then logs an error and carries on, which is what every other broken-mod path here
+    // already does.
+    static auto unprotected_error_panic(lua_State* lua_state) -> int
+    {
+        const char* const message = lua_gettop(lua_state) > 0 ? lua_tostring(lua_state, -1) : nullptr;
+        auto final_message = std::string{"Unprotected Lua error (no pcall on the C++ stack): "} + (message ? message : "<no error object>");
+        notify_error_callbacks(lua_state, final_message, final_message);
+        throw std::runtime_error{final_message};
+    }
+
     auto new_state() -> Lua&
     {
         auto new_lua_state = luaL_newstate();
+        // Installed on every state, before anything can run in it. Per global_State, so each mod's
+        // state needs its own; lua_newthread children inherit it.
+        lua_atpanic(new_lua_state, &unprotected_error_panic);
         return *lua_instances.emplace(new_lua_state, std::make_unique<Lua>(new_lua_state)).first->second;
     }
 

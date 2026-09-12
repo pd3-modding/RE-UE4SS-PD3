@@ -329,6 +329,11 @@ namespace RC
         RC_UE4SS_API auto async_lua() const -> const LuaMadeSimple::Lua*;
         RC_UE4SS_API auto get_lua_state() const -> lua_State*;
 
+        // Is this callback one of MINE? Pointer comparison against the four states a mod owns,
+        // and THE ONLY ownership test a teardown path may use: it cannot enter a lua_State, so
+        // it cannot raise a Lua error, so it cannot abort the process. See the definition.
+        [[nodiscard]] RC_UE4SS_API auto owns_lua_state(const LuaMadeSimple::Lua* state) const -> bool;
+
         RC_UE4SS_API auto get_scripts_path() const -> const std::filesystem::path& { return m_scripts_path; }
 
         RC_UE4SS_API auto actions_lock() -> void
